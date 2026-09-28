@@ -63,6 +63,7 @@ function harness() {
             rebuild: rebuildThread, saveEdited: saveEditedThread, parseEdited: parseEditedThread,
             parse: parseThreadOutput, lorebookSegments: lorebookSummarySegments,
             call: callCustomOpenAI, compress: runCompression, restore: restoreMemoryFromBackup,
+            threadOptions: getThreadRequestOptions, deleteProfile: deleteCurrentApiProfile,
             remove: function (ids) {
                 var m = readChatMemory();
                 removeThreadNodesForSegments(m, m.segments.filter(s => ids.includes(s.layerId)));
@@ -396,4 +397,90 @@ test('普通JSON内容数组同样适用于脉络请求', async () => {
     h.replies.push(jsonResponse([{ type: 'text', text: '[夏] ' }, { type: 'text', text: '初遇' }]));
     await h.plugin.weave('summary_0_9', '一', {});
     assert.equal(h.plugin.read().threadNodes[0].text, '[夏] 初遇');
+});
+
+function addThreadProfile(h) {
+    const profile = { id: 'thread-api', name: '脉络专用', url: 'https://thread.test/v1', apiKey: 'thread-test-only', model: 'thread-model' };
+    h.settings.autoSummaryWorldbookAdv.apiProfiles.push(profile);
+    h.settings.autoSummaryWorldbookAdv.threadProfileId = profile.id;
+    return profile;
+}
+
+test('脉络可选独立 API 预设，自动总结仍使用原配置', async () => {
+    const h = harness();
+    addThreadProfile(h);
+    h.replies.push(jsonResponse('总结全文'), jsonResponse('[夏] 初遇'));
+    assert.equal(await h.plugin.summary(0, 9, false), true);
+    const [summary, thread] = h.requests;
+    assert.equal(summary.url, 'https://example.test/v1/chat/completions');
+    assert.equal(summary.body.model, 'summary-model');
+    assert.equal(thread.url, 'https://thread.test/v1/chat/completions');
+    assert.equal(thread.body.model, 'thread-model');
+    assert.equal(thread.headers.Authorization, 'Bearer thread-test-only');
+    assert.equal(thread.body.messages[1].content, '【已有脉络】\n（空）\n\n【最新总结】\n总结全文');
+    assert.equal(h.settings.autoSummaryWorldbookAdv.activeProfileId, 'test');
+});
+
+test('独立预设同样适用于逐段重建，运行中修改下次生效', async () => {
+    const h = harness(), p = h.plugin, profile = addThreadProfile(h);
+    p.append(0, 9, '一'); p.append(10, 19, '二');
+    h.replies.push(() => {
+        profile.model = 'modified-model';
+        h.settings.autoSummaryWorldbookAdv.threadProfileId = '';
+        return jsonResponse('[一] 节点');
+    }, jsonResponse('[二] 节点'));
+    assert.equal(await p.rebuild(), true);
+    assert.deepEqual(h.requests.map(r => [r.url, r.body.model]), [
+        ['https://thread.test/v1/chat/completions', 'thread-model'],
+        ['https://thread.test/v1/chat/completions', 'thread-model']
+    ]);
+    assert.equal(p.threadOptions().apiConfig.model, 'summary-model');
+});
+
+test('总结开始时固定所选脉络预设，中途切换不会混用配置', async () => {
+    const h = harness(), profile = addThreadProfile(h);
+    h.replies.push(() => {
+        profile.model = 'modified-thread-model';
+        h.settings.autoSummaryWorldbookAdv.threadProfileId = '';
+        return jsonResponse('一');
+    }, jsonResponse('[一] 节点'));
+    await h.plugin.summary(0, 9, false);
+    assert.equal(h.requests[1].body.model, 'thread-model');
+    assert.equal(h.requests[1].url, 'https://thread.test/v1/chat/completions');
+});
+
+test('专用预设未填完整时保留总结，重建不会清空旧脉络', async () => {
+    const h = harness(), profile = addThreadProfile(h);
+    profile.model = '';
+    await h.plugin.saveEdited('人工脉络');
+    h.replies.push(jsonResponse('已保存的总结'));
+    assert.equal(await h.plugin.summary(0, 9, false), true);
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.plugin.read().segments[0].text, '已保存的总结');
+    assert.equal(await h.plugin.rebuild(), false);
+    assert.equal(h.plugin.read().threadNodes[0].text, '人工脉络');
+    assert.ok(h.toasts.some(t => t.includes('脉络所用 API')));
+});
+
+test('配置档被删除或丢失时同步回退到跟随总结', () => {
+    const h = harness(), profile = addThreadProfile(h);
+    h.settings.autoSummaryWorldbookAdv.activeProfileId = profile.id;
+    h.plugin.deleteProfile();
+    assert.equal(h.settings.autoSummaryWorldbookAdv.threadProfileId, '');
+    assert.equal(h.plugin.threadOptions().apiConfig.model, 'summary-model');
+    h.settings.autoSummaryWorldbookAdv.threadProfileId = 'no-longer-exists';
+    assert.equal(h.plugin.threadOptions().apiConfig.model, 'summary-model');
+    assert.equal(h.settings.autoSummaryWorldbookAdv.threadProfileId, '');
+});
+
+test('默认跟随复用传入的本轮总结配置快照，且与压缩选择独立', () => {
+    const h = harness();
+    const profile = addThreadProfile(h);
+    h.settings.autoSummaryWorldbookAdv.threadProfileId = '';
+    h.settings.autoSummaryWorldbookAdv.compressProfileId = profile.id;
+    const snapshot = { url: 'https://snapshot.test', apiKey: 'snapshot-key', model: 'snapshot-model' };
+    const result = h.plugin.threadOptions({ apiConfig: snapshot, stream: true });
+    assert.deepEqual(clone(result), { apiConfig: snapshot, stream: true });
+    snapshot.model = 'changed';
+    assert.equal(result.apiConfig.model, 'snapshot-model');
 });

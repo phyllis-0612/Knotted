@@ -287,6 +287,8 @@ let activePopupHandle = null;
         if (typeof settings.activeProfileId !== 'string') settings.activeProfileId = '';
         // 压缩专用配置档。空字符串表示「跟随总结」，使用 activeProfileId。
         if (typeof settings.compressProfileId !== 'string') settings.compressProfileId = '';
+        // 脉络专用配置档；空字符串跟随本轮总结使用的配置。
+        if (typeof settings.threadProfileId !== 'string') settings.threadProfileId = '';
 
         if (typeof settings.breakArmorPrompt !== 'string') {
             settings.breakArmorPrompt = window.localStorage?.getItem(STORAGE_KEY_CUSTOM_BREAK_ARMOR_PROMPT) ?? DEFAULT_BREAK_ARMOR_PROMPT;
@@ -424,6 +426,19 @@ let activePopupHandle = null;
         const profile = getActiveApiProfile();
         if (!profile) return { url: '', apiKey: '', model: '' };
         return { url: profile.url || '', apiKey: profile.apiKey || '', model: profile.model || '' };
+    }
+
+    function getThreadRequestOptions(summaryOptions = {}) {
+        const settings = getExtensionSettings();
+        const profile = settings.apiProfiles.find(p => p && p.id === settings.threadProfileId);
+        if (settings.threadProfileId && !profile) {
+            settings.threadProfileId = '';
+            saveExtensionSettingsNow();
+        }
+        const cfg = profile
+            ? { url: profile.url || '', apiKey: profile.apiKey || '', model: profile.model || '' }
+            : (summaryOptions.apiConfig || getActiveApiConfigForStorage());
+        return { apiConfig: { ...cfg }, stream: summaryOptions.stream ?? streamSummaryEnabled };
     }
 
     // 让旧脚本里的 localStorage 调用自动落到 ST 的 extension_settings/settings.json。
@@ -1384,6 +1399,7 @@ let activePopupHandle = null;
         updateApiStatusDisplay();
         // 配置档增删改之后，压缩下拉框也要跟着刷新
         if (typeof renderCompressProfileSelect === 'function') renderCompressProfileSelect();
+        renderThreadProfileSelect();
     }
 
     function createNewApiProfile() {
@@ -1415,6 +1431,7 @@ let activePopupHandle = null;
             showToastr("warning", "未找到当前配置档。");
             return;
         }
+        if (settings.threadProfileId === settings.activeProfileId) settings.threadProfileId = '';
         settings.activeProfileId = settings.apiProfiles[0]?.id || '';
         saveExtensionSettingsNow();
         syncCustomApiConfigFromActiveProfile();
@@ -2921,7 +2938,12 @@ let activePopupHandle = null;
 
                                 <div class="thread-editor">
                                     <label for="${SCRIPT_ID_PREFIX}-thread-content">事件脉络</label>
-                                    <p class="hint">每行一个极简事件节点，按时间串起历史总结。每次总结后自动编织，使用同一个 API，额外调用一次。手动修改以你保存的内容为准。</p>
+                                    <p class="hint">每行一个极简事件节点，按时间串起历史总结。每次总结后自动编织，额外调用一次 API。手动修改以你保存的内容为准。</p>
+                                    <div class="input-group">
+                                        <label for="${SCRIPT_ID_PREFIX}-thread-profile-select">脉络使用的 API 配置档</label>
+                                        <select id="${SCRIPT_ID_PREFIX}-thread-profile-select"></select>
+                                    </div>
+                                    <p class="hint">默认跟随总结，也可选择独立配置档。自动编织和重建脉络都使用此选择；在「接口」页管理配置档。</p>
                                     <textarea id="${SCRIPT_ID_PREFIX}-thread-content" rows="7" placeholder="[1999年夏] A与B初遇。&#10;[1999年秋] A与B相爱。"></textarea>
                                     <div class="button-group">
                                         <button id="${SCRIPT_ID_PREFIX}-thread-save" class="button button-primary">保存脉络</button>
@@ -3576,12 +3598,23 @@ let activePopupHandle = null;
                 jQuery_API(P + 'memory-toggle').on('click', function () {
                     reloadMemoryEditor();
                     renderCompressProfileSelect();
+                    renderThreadProfileSelect();
                 });
 
                 // 初始填值
                 jQuery_API(P + 'auto-compress-checkbox').prop('checked', autoCompressEnabled);
                 renderCompressProfileSelect();
                 reloadThreadEditor(true);
+                renderThreadProfileSelect();
+                jQuery_API(P + 'thread-profile-select').on('change', function () {
+                    var settings = getExtensionSettings();
+                    settings.threadProfileId = jQuery_API(this).val() || '';
+                    saveExtensionSettingsNow();
+                    var options = getThreadRequestOptions();
+                    if (!settings.threadProfileId) showToastr('info', '脉络将跟随每轮总结的 API 配置档。');
+                    else if (options.apiConfig.url && options.apiConfig.model) showToastr('success', '脉络将使用模型：' + options.apiConfig.model);
+                    else showToastr('warning', '该配置档尚未设置 API 地址或模型，请在「接口」页补齐。');
+                });
                 jQuery_API(P + 'thread-content').on('input', function () { threadEditorDirty = true; });
                 jQuery_API(P + 'thread-reload').on('click', function () {
                     if (threadEditorDirty && !confirm('重新载入会放弃尚未保存的脉络修改，继续吗？')) return;
@@ -4820,9 +4853,9 @@ let activePopupHandle = null;
         }
         var owner = captureChat();
         syncCustomApiConfigFromActiveProfile();
-        var options = { apiConfig: { ...customApiConfig }, stream: streamSummaryEnabled };
+        var options = getThreadRequestOptions({ apiConfig: { ...customApiConfig }, stream: streamSummaryEnabled });
         if (!options.apiConfig.url || !options.apiConfig.model) {
-            showToastr('warning', '请先配置总结 API 的地址和模型。');
+            showToastr('warning', '请先配置脉络所用 API 的地址和模型。');
             return false;
         }
         isRebuildingThread = true;
@@ -4845,7 +4878,7 @@ let activePopupHandle = null;
                 requireCurrentChat(owner);
                 if (revision !== threadRevision) throw new Error('脉络或记忆已被手动修改，重建已停止。');
                 if (jQuery_API && $popupInstance) $popupInstance.find('#' + SCRIPT_ID_PREFIX + '-thread-status')
-                    .text('正在编织第 ' + (completed + 1) + ' / ' + segments.length + ' 段…');
+                    .text('正在编织第 ' + (completed + 1) + ' / ' + segments.length + ' 段…（' + options.apiConfig.model + '）');
                 await weaveThreadForSummary(segment.layerId, segment.text, options, owner);
                 revision = threadRevision;
                 completed++;
@@ -5659,6 +5692,21 @@ let activePopupHandle = null;
         if ($ta.length) $ta.val(memoryToEditableText());
     }
 
+    function renderThreadProfileSelect() {
+        if (!jQuery_API) return;
+        var $sel = jQuery_API('#' + SCRIPT_ID_PREFIX + '-thread-profile-select');
+        if (!$sel.length) return;
+        var settings = getExtensionSettings();
+        getThreadRequestOptions(); // 已删除的配置档回退到跟随总结，并同步保存选择。
+        $sel.empty().append('<option value="">（跟随总结）</option>');
+        settings.apiProfiles.forEach(p => {
+            if (!p || !p.id) return;
+            var label = (p.name || '未命名') + (p.model ? ' · ' + p.model : ' · 未配置模型');
+            $sel.append(jQuery_API('<option></option>').attr('value', p.id).text(label));
+        });
+        $sel.val(settings.threadProfileId || '');
+    }
+
     /** 刷新压缩配置档下拉框。每次打开卡片时调用，保证列表与配置档同步。 */
     function renderCompressProfileSelect() {
         if (!jQuery_API) return;
@@ -5893,6 +5941,7 @@ let activePopupHandle = null;
         const owner = captureChat();
         syncCustomApiConfigFromActiveProfile();
         const requestOptions = { apiConfig: { ...customApiConfig }, stream: streamSummaryEnabled };
+        const threadRequestOptions = getThreadRequestOptions(requestOptions);
         let layerId = summaryLayerId(startInternalId, endInternalId);
         isSummaryInFlight = true;
         try {
@@ -6003,7 +6052,7 @@ let activePopupHandle = null;
             requireCurrentChat(owner);
             // 总结已保存后才编织；脉络失败不能把总结流程判为失败。
             try {
-                await weaveThreadForSummary(layerId, summaryText, requestOptions, owner);
+                await weaveThreadForSummary(layerId, summaryText, threadRequestOptions, owner);
             } catch (threadError) {
                 showToastr('warning', '总结已完成，脉络更新失败：' + threadError.message);
             }
