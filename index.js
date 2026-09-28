@@ -105,6 +105,16 @@ let activePopupHandle = null;
     const DEFAULT_LOREBOOK_HEADER_TEXT = `以下是本故事的历史总结
 [System Note: 以下总结仅作为剧情事实与时间线参考，不构成文风样本。仅参考事件，不套用文风。]`;
 
+    const THREAD_HEADER = '【脉络】以下是{{char}}与{{user}}共同经历的主干，按时间串联。各节点的细节见后文历史总结，以日期对应。';
+    const DEFAULT_THREAD_PROMPT = `你是事件脉络编织者。把平铺的剧情总结串成极简、连续的时间线。
+你只会收到【已有脉络】和【最新总结】。已有节点是只读的，只用来判断新事件如何承接，不得重抄、修改或覆盖。
+通常只输出一个新节点，用一句极短的话概括本次总结中最重要的事件或关系转折。多个连续事件可用“→”连接。不要堆砌细节、感官描写、心理分析或复述整份总结。
+格式必须为：[日期或时间节点] 人物与核心事件。
+例如：[1999年夏] A与B初遇。或：[2000年冬] A与B因误会分手。
+仅使用最新总结明确给出的事实与时间，不编造日期；无确切日期时用[重逢后]、[次日]等能由总结支持的事件节点，仍无依据则用[时间未明]。
+已有脉络为（空）时，可按最新总结内的事件先后输出多个极简节点，帮助冷启动建立主干。
+只输出节点，每行一个，以[开头且包含]。禁止标题、解释、代码块及旧节点。`;
+
     let currentLorebookHeaderText = DEFAULT_LOREBOOK_HEADER_TEXT;
 
     // ===== 新存储层：常量 =====
@@ -248,6 +258,13 @@ let activePopupHandle = null;
     let streamSummaryEnabled = true;
     // 本次会话内已确认过，不再重复询问。切换聊天时重置。
     let bulkConfirmedThisSession = false;
+    let isSummaryInFlight = false;
+    let isRebuildingThread = false;
+    let chatEpoch = 0;
+    let threadRevision = 0;
+    let threadEditorDirty = false;
+    let threadEditorMetadata = null;
+    let threadEditorNodes = [];
 
     const EXTENSION_SETTINGS_KEY = 'autoSummaryWorldbookAdv';
 
@@ -1738,7 +1755,10 @@ let activePopupHandle = null;
             return -1;
         }
         try {
+            const owner = captureChat();
             const entries = await TavernHelper_API.getLorebookEntries(currentPrimaryLorebook);
+            requireCurrentChat(owner);
+            if (reconcileLorebookThread(entries)) await syncThreadInjection(owner);
             let maxFloor = -1;
             // Determine the prefix based on the currently selected summary type
             const currentPrefix = selectedSummaryType === 'small' ? SUMMARY_LOREBOOK_SMALL_PREFIX : SUMMARY_LOREBOOK_LARGE_PREFIX;
@@ -1798,7 +1818,7 @@ let activePopupHandle = null;
             logDebug("Automatic summarization trigger: Core APIs not ready.");
             return;
         }
-        if (isAutoSummarizing) {
+        if (isAutoSummarizing || isSummaryInFlight || isRebuildingThread) {
             logDebug("Automatic summarization trigger: Process already running.");
             return;
         }
@@ -2009,6 +2029,9 @@ let activePopupHandle = null;
                 if (typeof tavern_events !== 'undefined') {
                     // 2.1 监听聊天切换事件
                     eventOn(tavern_events.CHAT_CHANGED, async (chatFileName) => {
+                        chatEpoch++;
+                        threadRevision++;
+                        threadEditorDirty = false;
                         logDebug(`监听到 [CHAT_CHANGED] 事件。聊天文件: ${chatFileName}`);
                         await resetScriptStateForNewChat(chatFileName);
                         // 换了聊天，确认状态重置，新聊天会重新询问
@@ -2016,6 +2039,17 @@ let activePopupHandle = null;
                         // 切换聊天后必须刷新注入：新聊天的记忆和旧聊天不同，
                         // setExtensionPrompt 是持久化的，不刷新会把上一个聊天的记忆带过来。
                         try { refreshInjection(); } catch (e) { logError('[存储层] 切换聊天刷新注入失败:', e); }
+                    });
+                    if (tavern_events.MESSAGE_DELETED) eventOn(tavern_events.MESSAGE_DELETED, () => {
+                        // 删除时立即失效等待中的请求，不能等防抖结束才阻止旧结果写回。
+                        chatEpoch++;
+                        threadRevision++;
+                        if (currentStorageMode === STORAGE_MODE_INJECT) {
+                            var chat = (typeof SillyTavern !== 'undefined' ? SillyTavern.getContext()?.chat : SillyTavern_API?.chat) || [];
+                            trimSegmentsAfterFloor(chat.length - 1);
+                            refreshInjection();
+                            reloadThreadEditor();
+                        }
                     });
 
                     // 2.2 为所有消息变动创建统一的防抖处理器
@@ -2030,6 +2064,11 @@ let activePopupHandle = null;
                                 return;
                             }
                             await loadAllChatMessages();
+                            if (eventName === 'MESSAGE_DELETED' && currentStorageMode === STORAGE_MODE_INJECT) {
+                                trimSegmentsAfterFloor(allChatMessages.length - 1);
+                                refreshInjection();
+                                reloadThreadEditor(true);
+                            }
                             await applyPersistedSummaryStatusFromLorebook();
                             await applyActualMessageVisibility();
                             if ($popupInstance) await updateUIDisplay();
@@ -2880,6 +2919,18 @@ let activePopupHandle = null;
                                     <button id="${SCRIPT_ID_PREFIX}-memory-clear-button" class="button button-subtle">清空全部记忆</button>
                                 </div>
 
+                                <div class="thread-editor">
+                                    <label for="${SCRIPT_ID_PREFIX}-thread-content">事件脉络</label>
+                                    <p class="hint">每行一个极简事件节点，按时间串起历史总结。每次总结后自动编织，使用同一个 API，额外调用一次。手动修改以你保存的内容为准。</p>
+                                    <textarea id="${SCRIPT_ID_PREFIX}-thread-content" rows="7" placeholder="[1999年夏] A与B初遇。&#10;[1999年秋] A与B相爱。"></textarea>
+                                    <div class="button-group">
+                                        <button id="${SCRIPT_ID_PREFIX}-thread-save" class="button button-primary">保存脉络</button>
+                                        <button id="${SCRIPT_ID_PREFIX}-thread-reload" class="button button-secondary">重新载入脉络</button>
+                                        <button id="${SCRIPT_ID_PREFIX}-thread-rebuild" class="button button-secondary">重建脉络</button>
+                                    </div>
+                                    <p id="${SCRIPT_ID_PREFIX}-thread-status" class="hint" role="status" aria-live="polite"></p>
+                                </div>
+
                                 <hr style="border:none;border-top:1px solid var(--line-soft);margin:4px 0;">
 
                                 <div class="input-group">
@@ -3530,6 +3581,30 @@ let activePopupHandle = null;
                 // 初始填值
                 jQuery_API(P + 'auto-compress-checkbox').prop('checked', autoCompressEnabled);
                 renderCompressProfileSelect();
+                reloadThreadEditor(true);
+                jQuery_API(P + 'thread-content').on('input', function () { threadEditorDirty = true; });
+                jQuery_API(P + 'thread-reload').on('click', function () {
+                    if (threadEditorDirty && !confirm('重新载入会放弃尚未保存的脉络修改，继续吗？')) return;
+                    reloadThreadEditor(true);
+                });
+                jQuery_API(P + 'thread-save').on('click', async function () {
+                    if (threadEditorMetadata !== getLiveChatMetadata()) { reloadThreadEditor(true); return; }
+                    try {
+                        await saveEditedThread(jQuery_API(P + 'thread-content').val(), threadEditorNodes);
+                        showToastr('success', '脉络已保存。');
+                    } catch (e) { showToastr('warning', '脉络保存或注入失败：' + e.message); }
+                });
+                jQuery_API(P + 'thread-rebuild').on('click', async function () {
+                    if (threadEditorDirty) {
+                        showToastr('info', '请先保存脉络修改，或重新载入后再重建。');
+                        return;
+                    }
+                    if (!await confirmCompat('重建会清空当前脉络，按时间顺序逐段读取已有总结，每段调用一次总结 API。中途失败会保留已完成的节点。是否开始？', '重建脉络')) return;
+                    var $button = jQuery_API(this);
+                    $button.prop('disabled', true).text('重建中…');
+                    try { await rebuildThread(); }
+                    finally { $button.prop('disabled', false).text('重建脉络'); }
+                });
 
                 // 存储模式切换
                 jQuery_API(P + 'storage-mode-select').val(currentStorageMode);
@@ -3572,6 +3647,9 @@ let activePopupHandle = null;
 
                 // 记忆：保存修改
                 jQuery_API(P + 'memory-save-button').on('click', function () {
+                    if (isSummaryInFlight || isRebuildingThread || isCompressing) {
+                        showToastr('info', '请等待当前总结、重建或压缩完成后再修改记忆。'); return;
+                    }
                     var raw = jQuery_API(P + 'memory-content-textarea').val();
                     if (typeof raw !== 'string' || raw.replace(/\s/g, '') === '') {
                         showToastr('warning', '内容为空。若要清空记忆请用「清空全部记忆」按钮。');
@@ -3596,9 +3674,19 @@ let activePopupHandle = null;
                     }
 
                     var mem = readChatMemory();
+                    var previous = mem.segments;
+                    segs.forEach(s => {
+                        var old = previous.find(p => p.startFloor === s.startFloor && p.endFloor === s.endFloor);
+                        s.layerId = old ? old.layerId : summaryLayerId(s.startFloor, s.endFloor);
+                        s.sourceLayerIds = old ? old.sourceLayerIds : [];
+                    });
+                    removeThreadNodesForSegments(mem, previous.filter(p => !segs.some(s => s.layerId === p.layerId)));
                     mem.segments = segs;
                     if (writeChatMemory(mem)) {
+                        threadRevision++;
                         refreshInjection();
+                        reloadThreadEditor();
+                        applyActualMessageVisibility();
                         if (typeof updateMemoryPanel === 'function') updateMemoryPanel();
                         showToastr('success', '记忆已保存，共 ' + segs.length + ' 段。');
                     } else {
@@ -3613,12 +3701,19 @@ let activePopupHandle = null;
 
                 // 记忆：清空
                 jQuery_API(P + 'memory-clear-button').on('click', function () {
+                    if (isSummaryInFlight || isRebuildingThread || isCompressing) {
+                        showToastr('info', '请等待当前总结、重建或压缩完成后再清空记忆。'); return;
+                    }
                     if (!confirm('确定清空当前聊天的全部记忆吗？此操作不可撤销。\n建议先「导出到世界书」备份。')) return;
                     var mem = readChatMemory();
                     mem.segments = [];
-                    writeChatMemory(mem);
+                    mem.threadNodes = [];
+                    if (!writeChatMemory(mem)) { showToastr('error', '清空失败。'); return; }
+                    threadRevision++;
                     refreshInjection();
                     reloadMemoryEditor();
+                    reloadThreadEditor(true);
+                    applyActualMessageVisibility();
                     if (typeof updateMemoryPanel === 'function') updateMemoryPanel();
                     showToastr('success', '记忆已清空。');
                 });
@@ -3938,6 +4033,9 @@ let activePopupHandle = null;
                         };
                         
                         await TavernHelper_API.setLorebookEntries(currentPrimaryLorebook, [updatedEntryData]);
+                        reconcileLorebookThread(await TavernHelper_API.getLorebookEntries(currentPrimaryLorebook));
+                        await syncThreadInjection();
+                        reloadThreadEditor();
                         showToastr("success", `世界书条目 "${worldbookEntryCache.comment}" 已成功保存！`);
                         logDebug(`Worldbook entry UID ${worldbookEntryCache.uid} updated successfully.`);
                         
@@ -3968,6 +4066,7 @@ let activePopupHandle = null;
     function updateMemoryPanel() {
         try {
             if (!jQuery_API) return;
+            reloadThreadEditor();
             var $mode = jQuery_API('#' + SCRIPT_ID_PREFIX + '-mem-mode');
             if (!$mode.length) return;
             var $bar = $popupInstance ? $popupInstance.find('.strata-bar') : jQuery_API();
@@ -4216,7 +4315,7 @@ let activePopupHandle = null;
             }
 
             var msg = '检测到 ' + unsummarized + ' 楼尚未总结。\n\n'
-                + '将分约 ' + rounds + ' 轮进行总结，每轮调用一次 API。\n'
+                + '将分约 ' + rounds + ' 轮进行总结，每轮调用两次 API（总结 + 脉络）。\n'
                 + '过程中可能触发记忆压缩，会产生额外调用。\n\n'
                 + '是否现在开始？';
 
@@ -4235,6 +4334,9 @@ let activePopupHandle = null;
     }
 
     async function handleAutoSummarize() {
+        if (isRebuildingThread || isSummaryInFlight) {
+            showToastr('info', '脉络重建或单次总结正在进行，请等待完成。'); return;
+        }
         if (isAutoSummarizing) {
             const runningMessage = "批量总结已在进行中，请等待当前任务完成。";
             showToastr("info", runningMessage);
@@ -4337,8 +4439,10 @@ let activePopupHandle = null;
 
             logDebug(`自动总结：已总结到 ${maxSummarizedFloor + 1} 楼。剩余未总结 ${unsummarizedCount} 楼。下次区块大小 ${effectiveChunkSize}。触发阈值 ${triggerThreshold}`);
             let completedRounds = 0;
+            const bulkOwner = captureChat();
 
             while (unsummarizedCount >= triggerThreshold) {
+                requireCurrentChat(bulkOwner);
                 logDebug(`自动总结循环：准备处理区块 (未总结 ${unsummarizedCount} >= 阈值 ${triggerThreshold})。当前 nextChunkStartFloor (0-based): ${nextChunkStartFloor}, 区块大小: ${effectiveChunkSize}`);
                 const currentStatusText = `正在总结 ${nextChunkStartFloor + 1} 至 ${nextChunkStartFloor + effectiveChunkSize} 楼...`;
                 if($statusMessageSpan) $statusMessageSpan.text(currentStatusText); else showToastr("info", currentStatusText);
@@ -4365,6 +4469,7 @@ let activePopupHandle = null;
                  if (!success) {
                     throw new Error(lastSummaryErrorMessage || `区块 ${nextChunkStartFloor + 1}-${nextChunkStartFloor + effectiveChunkSize} 总结失败。`);
                 }
+                requireCurrentChat(bulkOwner);
 
                 // Recalculate state after a successful chunk
                 completedRounds += 1;
@@ -4538,11 +4643,234 @@ let activePopupHandle = null;
      * 关键点：楼层是**真实数字**，不再从条目名反推。
      */
 
+    function summaryLayerId(startFloor, endFloor) {
+        return 'summary_' + startFloor + '_' + endFloor;
+    }
+
+    function segmentLayerIds(segment) {
+        return [segment.layerId || summaryLayerId(segment.startFloor, segment.endFloor), ...(segment.sourceLayerIds || [])];
+    }
+
+    function removeThreadNodesForSegments(memory, removed) {
+        var ids = new Set(removed.flatMap(segmentLayerIds));
+        memory.threadNodes = memory.threadNodes.filter(n => !ids.has(n.layerId));
+    }
+
+    function captureChat() {
+        return { metadata: getLiveChatMetadata(), identifier: currentChatFileIdentifier, epoch: chatEpoch, mode: currentStorageMode };
+    }
+
+    function isCurrentChat(owner) {
+        return owner.metadata === getLiveChatMetadata() && owner.identifier === currentChatFileIdentifier
+            && owner.epoch === chatEpoch && owner.mode === currentStorageMode;
+    }
+
+    function requireCurrentChat(owner) {
+        if (!isCurrentChat(owner)) throw new Error('聊天或存储模式已切换，本次任务已停止。');
+    }
+
+    function threadPrefix(nodes) {
+        return nodes.length ? THREAD_HEADER + '\n' + nodes.map(n => n.text).join('\n') + '\n\n' : '';
+    }
+
+    function stripThreadPrefix(content) {
+        if (!content.startsWith(THREAD_HEADER + '\n')) return content;
+        var end = content.indexOf('\n\n');
+        return end < 0 ? '' : content.slice(end + 2);
+    }
+
+    function parseThreadOutput(text) {
+        return String(text || '').split(/\r?\n/).map(line => line.trim())
+            .filter(line => line.startsWith('[') && line.includes(']'));
+    }
+
+    // 世界书已有总结也能逐段重建；旧版本首段没有范围标记，从条目名补齐。
+    function lorebookSummarySegments(entry) {
+        var range = (entry.comment || '').match(/-(\d+)-(\d+)$/);
+        if (!range) return [];
+        var body = stripThreadPrefix(entry.content || '');
+        for (var header of [currentLorebookHeaderText, DEFAULT_LOREBOOK_HEADER_TEXT]) {
+            if (header && body.startsWith(header + '\n\n')) { body = body.slice(header.length + 2); break; }
+        }
+        var markers = [...body.matchAll(/(?:^|\n)---\r?\n\[(\d+)-(\d+)\]\r?\n/g)];
+        var segments = [];
+        function add(start, end, text) {
+            if (text.trim()) segments.push({ layerId: summaryLayerId(start, end), startFloor: start, endFloor: end, text: text.trim() });
+        }
+        add(Number(range[1]) - 1, markers.length ? Number(markers[0][1]) - 2 : Number(range[2]) - 1,
+            body.slice(0, markers.length ? markers[0].index : body.length));
+        markers.forEach((m, i) => add(Number(m[1]) - 1, Number(m[2]) - 1,
+            body.slice(m.index + m[0].length, i + 1 < markers.length ? markers[i + 1].index : body.length)));
+        return segments;
+    }
+
+    async function currentLorebookSummaryEntries() {
+        if (!currentPrimaryLorebook || !TavernHelper_API?.getLorebookEntries) return [];
+        var prefix = (selectedSummaryType === 'small' ? SUMMARY_LOREBOOK_SMALL_PREFIX : SUMMARY_LOREBOOK_LARGE_PREFIX)
+            + currentChatFileIdentifier + '-';
+        return (await TavernHelper_API.getLorebookEntries(currentPrimaryLorebook))
+            .filter(e => e.enabled && e.comment?.startsWith(prefix) && /-\d+-\d+$/.test(e.comment));
+    }
+
+    async function syncThreadInjection(owner = captureChat()) {
+        requireCurrentChat(owner);
+        if (currentStorageMode === STORAGE_MODE_INJECT) { refreshInjection(); return; }
+        var entries = await currentLorebookSummaryEntries();
+        requireCurrentChat(owner);
+        reconcileLorebookThread(entries);
+        if (!entries.length) return;
+        entries.sort((a, b) => Number(b.comment.match(/-(\d+)-(\d+)$/)[2]) - Number(a.comment.match(/-(\d+)-(\d+)$/)[2]));
+        // 同样使用一个已有总结块：先移除旧前缀，再把最新脉络放在最完整的条目里。
+        var prefix = threadPrefix(readChatMemory().threadNodes);
+        await TavernHelper_API.setLorebookEntries(currentPrimaryLorebook, entries.map((e, i) => ({
+            ...e, content: (i === 0 ? prefix : '') + stripThreadPrefix(e.content || '')
+        })));
+        requireCurrentChat(owner);
+    }
+
+    function reconcileLorebookThread(entries) {
+        var prefix = (selectedSummaryType === 'small' ? SUMMARY_LOREBOOK_SMALL_PREFIX : SUMMARY_LOREBOOK_LARGE_PREFIX)
+            + currentChatFileIdentifier + '-';
+        var ids = [...new Set(entries.filter(e => e.enabled && e.comment?.startsWith(prefix))
+            .flatMap(lorebookSummarySegments).map(s => s.layerId))];
+        var memory = readChatMemory();
+        var oldIds = memory.lorebookLayerIds[selectedSummaryType] || [];
+        if (JSON.stringify(ids) === JSON.stringify(oldIds)) return false;
+        var removed = oldIds.filter(id => !ids.includes(id));
+        memory.threadNodes = memory.threadNodes.filter(n => !removed.includes(n.layerId));
+        memory.lorebookLayerIds[selectedSummaryType] = ids;
+        if (!writeChatMemory(memory)) throw new Error('世界书脉络关联保存失败。');
+        if (removed.length) threadRevision++;
+        return removed.length > 0;
+    }
+
+    async function weaveThreadForSummary(layerId, summaryText, requestOptions, owner = captureChat()) {
+        requireCurrentChat(owner);
+        var revision = threadRevision;
+        var memory = readChatMemory();
+        var nodes = memory.threadNodes;
+        var userPrompt = '【已有脉络】\n' + (nodes.length ? nodes.map(n => n.text).join('\n') : '（空）')
+            + '\n\n【最新总结】\n' + summaryText;
+        var output = await callCustomOpenAI(DEFAULT_THREAD_PROMPT, userPrompt, null, requestOptions);
+        requireCurrentChat(owner);
+        if (revision !== threadRevision) throw new Error('脉络或记忆已被修改，已跳过本次生成结果，请按需重建。');
+        var lines = parseThreadOutput(output);
+        if (!lines.length) throw new Error('模型没有返回有效脉络节点（每行须以[开头并包含]）。');
+        if (nodes.length) lines = lines.slice(0, 1);
+        var replacement = lines.map(text => ({ id: createId('node'), layerId, text }));
+        var first = nodes.findIndex(n => n.layerId === layerId);
+        var kept = nodes.filter(n => n.layerId !== layerId);
+        // 重跑原总结在原位置替换；新总结只追加。
+        kept.splice(first < 0 ? kept.length : first, 0, ...replacement);
+        memory = readChatMemory();
+        memory.threadNodes = kept;
+        if (!writeChatMemory(memory)) throw new Error('脉络保存失败。');
+        threadRevision++;
+        var appliedRevision = threadRevision;
+        await syncThreadInjection(owner);
+        if (appliedRevision !== threadRevision) throw new Error('脉络或记忆已被修改，已停止后续编织。');
+        reloadThreadEditor();
+    }
+
+    function reloadThreadEditor(force = false) {
+        if (!jQuery_API || !$popupInstance) return;
+        var $input = $popupInstance.find('#' + SCRIPT_ID_PREFIX + '-thread-content');
+        if (!$input.length) return;
+        var metadata = getLiveChatMetadata();
+        if (!force && threadEditorDirty && metadata === threadEditorMetadata) return;
+        threadEditorMetadata = metadata;
+        threadEditorNodes = readChatMemory().threadNodes;
+        threadEditorDirty = false;
+        $input.val(threadEditorNodes.map(n => n.text).join('\n'));
+    }
+
+    // 文本完全由用户决定；保留未改动行的关联，修改行继承相邻原节点，新增行单独标记。
+    function parseEditedThread(text, oldNodes) {
+        var lines = String(text || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+        var used = new Set();
+        var nodes = lines.map(line => {
+            var index = oldNodes.findIndex((n, i) => !used.has(i) && n.text === line);
+            if (index < 0) return null;
+            used.add(index);
+            return { ...oldNodes[index], text: line };
+        });
+        var remaining = oldNodes.filter((n, i) => !used.has(i));
+        return nodes.map((node, i) => {
+            if (node) return node;
+            var old = remaining.shift();
+            return { id: old ? old.id : createId('node'), layerId: old ? old.layerId : createId('manual'), text: lines[i] };
+        });
+    }
+
+    async function saveEditedThread(text, oldNodes = readChatMemory().threadNodes) {
+        var owner = captureChat();
+        var memory = readChatMemory();
+        memory.threadNodes = parseEditedThread(text, oldNodes);
+        if (!writeChatMemory(memory)) throw new Error('当前聊天元数据无法保存。');
+        threadRevision++;
+        threadEditorDirty = false;
+        await syncThreadInjection(owner);
+        reloadThreadEditor(true);
+    }
+
+    async function rebuildThread() {
+        if (isRebuildingThread || isSummaryInFlight || isAutoSummarizing || isCompressing) {
+            showToastr('info', '总结、压缩或脉络重建正在进行，请等待完成。');
+            return false;
+        }
+        var owner = captureChat();
+        syncCustomApiConfigFromActiveProfile();
+        var options = { apiConfig: { ...customApiConfig }, stream: streamSummaryEnabled };
+        if (!options.apiConfig.url || !options.apiConfig.model) {
+            showToastr('warning', '请先配置总结 API 的地址和模型。');
+            return false;
+        }
+        isRebuildingThread = true;
+        var completed = 0;
+        try {
+            var segments = currentStorageMode === STORAGE_MODE_INJECT ? readChatMemory().segments
+                : (await currentLorebookSummaryEntries()).flatMap(lorebookSummarySegments);
+            requireCurrentChat(owner);
+            segments.sort((a, b) => a.startFloor - b.startFloor);
+            segments = segments.filter((s, i) => segments.findIndex(t => t.layerId === s.layerId) === i);
+            if (!segments.length) { showToastr('info', '当前没有已有总结可重建脉络。'); return false; }
+            var memory = readChatMemory();
+            memory.threadNodes = [];
+            if (!writeChatMemory(memory)) throw new Error('无法清空并保存脉络。');
+            threadRevision++;
+            var revision = threadRevision;
+            await syncThreadInjection(owner);
+            reloadThreadEditor(true);
+            for (var segment of segments) {
+                requireCurrentChat(owner);
+                if (revision !== threadRevision) throw new Error('脉络或记忆已被手动修改，重建已停止。');
+                if (jQuery_API && $popupInstance) $popupInstance.find('#' + SCRIPT_ID_PREFIX + '-thread-status')
+                    .text('正在编织第 ' + (completed + 1) + ' / ' + segments.length + ' 段…');
+                await weaveThreadForSummary(segment.layerId, segment.text, options, owner);
+                revision = threadRevision;
+                completed++;
+            }
+            showToastr('success', '脉络重建完成，共处理 ' + completed + ' 段总结。');
+            return true;
+        } catch (e) {
+            showToastr('warning', '脉络重建已停止（已完成 ' + completed + ' 段）：' + e.message);
+            return false;
+        } finally {
+            isRebuildingThread = false;
+            if (isCurrentChat(owner)) {
+                reloadThreadEditor();
+                if (jQuery_API && $popupInstance) $popupInstance.find('#' + SCRIPT_ID_PREFIX + '-thread-status').text('');
+            }
+        }
+    }
+
     /** 返回空的数据结构。任何读取失败都返回它，保证调用方拿到的一定是合法对象。 */
     function makeEmptyMemory() {
         return {
             version: 1,
             segments: [],
+            threadNodes: [],
+            lorebookLayerIds: {},
             header: '',
             updatedAt: 0
         };
@@ -4621,6 +4949,13 @@ let activePopupHandle = null;
         out.version = (typeof raw.version === 'number') ? raw.version : 1;
         out.header = (typeof raw.header === 'string') ? raw.header : '';
         out.updatedAt = (typeof raw.updatedAt === 'number') ? raw.updatedAt : 0;
+        for (var type of ['small', 'large']) {
+            if (Array.isArray(raw.lorebookLayerIds?.[type])) out.lorebookLayerIds[type] = raw.lorebookLayerIds[type].slice();
+        }
+        if (Array.isArray(raw.threadNodes)) {
+            out.threadNodes = raw.threadNodes.filter(n => n && typeof n.text === 'string' && n.text.trim())
+                .map(n => ({ id: n.id || createId('node'), layerId: n.layerId || createId('manual'), text: n.text }));
+        }
 
         // segments 逐条校验，坏数据直接丢弃而不是整体报错
         if (Object.prototype.toString.call(raw.segments) === '[object Array]') {
@@ -4630,6 +4965,8 @@ let activePopupHandle = null;
                 if (typeof s.text !== 'string' || s.text === '') continue;
                 if (typeof s.startFloor !== 'number' || typeof s.endFloor !== 'number') continue;
                 out.segments.push({
+                    layerId: s.layerId || summaryLayerId(s.startFloor, s.endFloor),
+                    sourceLayerIds: Array.isArray(s.sourceLayerIds) ? s.sourceLayerIds.slice() : [],
                     gen: (typeof s.gen === 'number') ? s.gen : 0,
                     startFloor: s.startFloor,
                     endFloor: s.endFloor,
@@ -4656,6 +4993,7 @@ let activePopupHandle = null;
         if (!memory || typeof memory !== 'object') memory = makeEmptyMemory();
         memory.version = 1;
         memory.updatedAt = Date.now();
+        var previous = meta[CHAT_META_KEY];
         meta[CHAT_META_KEY] = memory;
 
         try {
@@ -4664,11 +5002,13 @@ let activePopupHandle = null;
                 saveFn();
             } else {
                 logError('[存储层] 找不到 saveMetadata，数据可能不会持久化。');
+                meta[CHAT_META_KEY] = previous;
                 return false;
             }
             logDebug('[存储层] 已写入 chat_metadata，段数:', memory.segments.length);
             return true;
         } catch (e) {
+            meta[CHAT_META_KEY] = previous;
             logError('[存储层] 保存 metadata 失败:', e);
             return false;
         }
@@ -4691,13 +5031,26 @@ let activePopupHandle = null;
     /** 追加一段新总结。startFloor / endFloor 都是 0-based 且含端点。 */
     function appendSummarySegment(startFloor, endFloor, text) {
         var mem = readChatMemory();
-        mem.segments.push({
+        var existing = mem.segments.find(s => s.startFloor === startFloor && s.endFloor === endFloor);
+        if (mem.segments.some(s => s !== existing && s.startFloor <= endFloor && s.endFloor >= startFloor)) {
+            throw new Error('该楼层与已有记忆区间重叠。请先在记忆编辑框中删除对应段落，再重新总结。');
+        }
+        var segment = {
+            layerId: existing ? existing.layerId : summaryLayerId(startFloor, endFloor),
+            sourceLayerIds: [],
             gen: 0,
             startFloor: startFloor,
             endFloor: endFloor,
             text: text,
             createdAt: Date.now()
-        });
+        };
+        if (existing) {
+            // 重跑压缩段时，其来源节点也应随该段替换。
+            mem.threadNodes = mem.threadNodes.filter(n => !segmentLayerIds(existing).includes(n.layerId) || n.layerId === segment.layerId);
+            mem.segments[mem.segments.indexOf(existing)] = segment;
+        } else {
+            mem.segments.push(segment);
+        }
         // 保持按起始楼层升序，后续压缩逻辑依赖这个顺序
         mem.segments.sort(function (a, b) { return a.startFloor - b.startFloor; });
         return writeChatMemory(mem);
@@ -4717,17 +5070,19 @@ let activePopupHandle = null;
         }
         if (kept.length === before) return 0;
         mem.segments = kept;
-        writeChatMemory(mem);
+        removeThreadNodesForSegments(mem, readChatMemory().segments.filter(s => !kept.some(k => k.layerId === s.layerId)));
+        if (!writeChatMemory(mem)) return 0;
+        threadRevision++;
         return before - kept.length;
     }
 
     /** 把全部段落拼成注入用的文本。没有内容时返回空字符串。 */
     function buildInjectionText() {
         var mem = readChatMemory();
-        if (mem.segments.length === 0) return '';
+        if (mem.segments.length === 0 && mem.threadNodes.length === 0) return '';
 
         var head = mem.header || currentLorebookHeaderText || DEFAULT_LOREBOOK_HEADER_TEXT;
-        var parts = [head, ''];
+        var parts = mem.segments.length ? [head, ''] : [];
         for (var i = 0; i < mem.segments.length; i++) {
             var s = mem.segments[i];
             var tag;
@@ -4740,7 +5095,7 @@ let activePopupHandle = null;
             parts.push(s.text);
             parts.push('');
         }
-        return parts.join('\n');
+        return threadPrefix(mem.threadNodes) + parts.join('\n');
     }
 
     /**
@@ -4796,6 +5151,9 @@ let activePopupHandle = null;
      * 返回 { ok, message }
      */
     function switchStorageMode(targetMode) {
+        if (isSummaryInFlight || isRebuildingThread || isCompressing) {
+            return { ok: false, message: '请等待总结、脉络重建或压缩完成后再切换存储模式。' };
+        }
         if (targetMode !== STORAGE_MODE_INJECT && targetMode !== STORAGE_MODE_LOREBOOK) {
             return { ok: false, message: '未知的存储模式。' };
         }
@@ -4938,54 +5296,7 @@ let activePopupHandle = null;
      * URL 拼接逻辑与 callCustomOpenAI 完全一致，保持行为统一。
      */
     async function callCustomOpenAIWith(systemPrompt, userPromptContent, apiConfigOverride) {
-        var cfg;
-        if (apiConfigOverride && apiConfigOverride.url && apiConfigOverride.model) {
-            cfg = apiConfigOverride;
-        } else {
-            syncCustomApiConfigFromActiveProfile();
-            cfg = customApiConfig;
-        }
-        if (!cfg.url || !cfg.model) {
-            throw new Error("自定义API URL或模型未配置。");
-        }
-        if (!systemPrompt || !systemPrompt.trim()) {
-            throw new Error("系统提示词为空。");
-        }
-
-        var fullApiUrl = cfg.url;
-        if (fullApiUrl.charAt(fullApiUrl.length - 1) !== '/') { fullApiUrl += '/'; }
-        if (fullApiUrl.indexOf('generativelanguage.googleapis.com') !== -1) {
-            if (fullApiUrl.indexOf('chat/completions') === -1) { fullApiUrl += 'chat/completions'; }
-        } else {
-            if (fullApiUrl.slice(-4) === '/v1/') { fullApiUrl += 'chat/completions'; }
-            else if (fullApiUrl.indexOf('/chat/completions') === -1) { fullApiUrl += 'v1/chat/completions'; }
-        }
-
-        var headers = { 'Content-Type': 'application/json' };
-        if (cfg.apiKey) { headers['Authorization'] = 'Bearer ' + cfg.apiKey; }
-
-        var body = JSON.stringify({
-            model: cfg.model,
-            messages: [
-                { role: "system", content: systemPrompt },
-                { role: "user", content: userPromptContent }
-            ],
-            stream: false
-        });
-
-        logDebug('[压缩] 调用API:', fullApiUrl, '模型:', cfg.model);
-        var response = await fetch(fullApiUrl, { method: 'POST', headers: headers, body: body });
-        if (!response.ok) {
-            var errorText = await response.text();
-            logError('[压缩] API调用失败:', response.status, errorText);
-            throw new Error('API请求失败: ' + response.status + ' ' + response.statusText + '. 详情: ' + errorText);
-        }
-        var data = await response.json();
-        if (data.choices && data.choices.length > 0 && data.choices[0].message && data.choices[0].message.content) {
-            return data.choices[0].message.content.trim();
-        }
-        logError('[压缩] API响应格式不正确:', data);
-        throw new Error('API响应格式不正确或未返回内容。');
+        return callCustomOpenAI(systemPrompt, userPromptContent, null, { apiConfig: apiConfigOverride, stream: false });
     }
 
     // ==========================================================
@@ -5033,6 +5344,7 @@ let activePopupHandle = null;
 
     /** 从备份恢复。返回恢复的段数，无备份返回 -1。 */
     function restoreMemoryFromBackup() {
+        if (isSummaryInFlight || isRebuildingThread || isCompressing) return -1;
         if (!stCaps.chatMetadata) return -1;
         var meta = getLiveChatMetadata();
         if (!meta || typeof meta !== 'object') return -1;
@@ -5042,7 +5354,8 @@ let activePopupHandle = null;
         var mem = readChatMemory();
         mem.segments = JSON.parse(JSON.stringify(bak.segments));
         if (typeof bak.header === 'string') mem.header = bak.header;
-        writeChatMemory(mem);
+        if (!writeChatMemory(mem)) return -1;
+        threadRevision++;
         refreshInjection();
         logDebug('[压缩] 已从备份恢复，段数:', mem.segments.length);
         return mem.segments.length;
@@ -5111,6 +5424,9 @@ let activePopupHandle = null;
      * 返回 { ok, message, before, after }
      */
     async function runCompression() {
+        if (isSummaryInFlight || isRebuildingThread) {
+            return { ok: false, message: '总结或脉络重建正在进行，请等待完成。' };
+        }
         if (isCompressing) {
             return { ok: false, message: '压缩正在进行中，请稍候。' };
         }
@@ -5131,6 +5447,7 @@ let activePopupHandle = null;
         }
 
         isCompressing = true;
+        var compressOwner = captureChat();
         var beforeChars = plan.beforeChars;
 
         try {
@@ -5147,6 +5464,7 @@ let activePopupHandle = null;
             var compressCfg = getCompressApiConfig();
             logDebug('[压缩] 使用配置档:', (getCompressApiProfile() ? getCompressApiProfile().name : '无'), '模型:', compressCfg.model);
             var compressed = await callCustomOpenAIWith(currentCompressPrompt, userPrompt, compressCfg);
+            requireCurrentChat(compressOwner);
             if (!compressed || compressed.trim() === '') {
                 throw new Error('AI 未返回有效的压缩内容。');
             }
@@ -5162,6 +5480,8 @@ let activePopupHandle = null;
             }
 
             var newSeg = {
+                layerId: plan.toCompress[0].layerId,
+                sourceLayerIds: [...new Set(plan.toCompress.flatMap(segmentLayerIds))],
                 gen: maxGen + 1,
                 startFloor: minStart,
                 endFloor: maxEnd,
@@ -5405,18 +5725,22 @@ let activePopupHandle = null;
     // ===== 压缩功能结束 =====
 
     // 【90修改】调用自定义OpenAI API的函数及报错
-    async function callCustomOpenAI(systemMsgContent, userPromptContent, onStreamUpdate) { /* ... (no change) ... */
+    async function callCustomOpenAI(systemMsgContent, userPromptContent, onStreamUpdate, requestOptions = {}) {
         syncCustomApiConfigFromActiveProfile();
-        if (!customApiConfig.url || !customApiConfig.model) {
+        const cfg = { ...(requestOptions.apiConfig || customApiConfig) };
+        if (!cfg.url || !cfg.model) {
             throw new Error("自定义API URL或模型未配置。");
         }
-        if (!currentSummaryPrompt || !currentSummaryPrompt.trim()) {
+        if (systemMsgContent == null && (!currentSummaryPrompt || !currentSummaryPrompt.trim())) {
             throw new Error("总结预设为空，请先填写总结预设或点击“载入模板”。");
         }
         // Combine optional break armor and required summary prompt for the system message
-        const combinedSystemPrompt = [currentBreakArmorPrompt, currentSummaryPrompt].filter(part => part && part.trim()).join("\n\n");
+        const combinedSystemPrompt = systemMsgContent == null
+            ? [currentBreakArmorPrompt, currentSummaryPrompt].filter(part => part && part.trim()).join("\n\n")
+            : systemMsgContent;
+        if (!combinedSystemPrompt || !combinedSystemPrompt.trim()) throw new Error('系统提示词为空。');
 
-        let fullApiUrl = customApiConfig.url;
+        let fullApiUrl = cfg.url;
         if (!fullApiUrl.endsWith('/')) { fullApiUrl += '/'; }
         // Special handling for Google's OpenAI-compatible endpoint, which might not follow the /v1 convention
         if (fullApiUrl.includes('generativelanguage.googleapis.com')) {
@@ -5427,14 +5751,14 @@ let activePopupHandle = null;
         }
 
         const headers = { 'Content-Type': 'application/json' };
-        if (customApiConfig.apiKey) { headers['Authorization'] = `Bearer ${customApiConfig.apiKey}`; }
-        const useStreaming = streamSummaryEnabled;
+        if (cfg.apiKey) { headers['Authorization'] = `Bearer ${cfg.apiKey}`; }
+        const useStreaming = requestOptions.stream ?? streamSummaryEnabled;
         const body = JSON.stringify({
-            model: customApiConfig.model,
+            model: cfg.model,
             messages: [ { role: "system", content: combinedSystemPrompt }, { role: "user", content: userPromptContent } ],
             stream: useStreaming,
         });
-        logDebug("调用自定义API:", fullApiUrl, "模型:", customApiConfig.model, "附带头部信息:", headers);
+        logDebug("调用自定义API:", fullApiUrl, "模型:", cfg.model);
         // logDebug("Combined System Prompt for API call:\n", combinedSystemPrompt); // For debugging combined prompt
         let response = await fetch(fullApiUrl, { method: 'POST', headers: headers, body: body });
         if (!response.ok) {
@@ -5443,7 +5767,7 @@ let activePopupHandle = null;
             if (canRetryWithoutStream) {
                 logWarn('当前API不支持流式总结，已自动改用普通响应。');
                 const fallbackBody = JSON.stringify({
-                    model: customApiConfig.model,
+                    model: cfg.model,
                     messages: [ { role: "system", content: combinedSystemPrompt }, { role: "user", content: userPromptContent } ],
                     stream: false,
                 });
@@ -5536,6 +5860,11 @@ let activePopupHandle = null;
     }
 
     async function proceedWithSummarization(startInternalId, endInternalId, shouldUploadToLorebook, onStreamUpdate) { /* ... (no change) ... */
+        if (isSummaryInFlight || isRebuildingThread) {
+            lastSummaryErrorMessage = '总结或脉络重建正在进行，请等待完成。';
+            showToastr('info', lastSummaryErrorMessage);
+            return false;
+        }
         if (isCompressing) {
             lastSummaryErrorMessage = '压缩正在进行中，请稍后再总结。';
             showToastr('warning', lastSummaryErrorMessage);
@@ -5561,9 +5890,23 @@ let activePopupHandle = null;
             return `${prefix}: ${msg.message}`;
         }).join("\n\n");
         const userPromptForSummarization = `聊天记录上下文如下（请严格对这部分内容进行摘要）：\n\n${chatContextForSummary}\n\n请对以上内容进行摘要：`;
+        const owner = captureChat();
+        syncCustomApiConfigFromActiveProfile();
+        const requestOptions = { apiConfig: { ...customApiConfig }, stream: streamSummaryEnabled };
+        let layerId = summaryLayerId(startInternalId, endInternalId);
+        isSummaryInFlight = true;
         try {
+            if (owner.mode === STORAGE_MODE_INJECT) {
+                var segments = readChatMemory().segments;
+                var existingSegment = segments.find(s => s.startFloor === startInternalId && s.endFloor === endInternalId);
+                if (segments.some(s => s !== existingSegment && s.startFloor <= endInternalId && s.endFloor >= startInternalId)) {
+                    throw new Error('该楼层与已有记忆区间重叠。请先删除对应段落，再重新总结。');
+                }
+                if (existingSegment) layerId = existingSegment.layerId;
+            }
             // Note: callCustomOpenAI now internally combines currentBreakArmorPrompt and currentSummaryPrompt
-            const summaryText = await callCustomOpenAI(/* systemMsgContent is now handled internally */ null, userPromptForSummarization, onStreamUpdate);
+            const summaryText = await callCustomOpenAI(null, userPromptForSummarization, onStreamUpdate, requestOptions);
+            requireCurrentChat(owner);
             if (!summaryText || summaryText.trim() === "") { throw new Error("自定义AI未能生成有效的摘要。"); }
             logDebug(`自定义AI生成的摘要 (${floorRangeText}):\n${summaryText}`);
             if($statusMessageSpan) $statusMessageSpan.text(`摘要已生成 (${floorRangeText})。${shouldUploadToLorebook ? '正在处理世界书条目...' : ''}`);
@@ -5592,6 +5935,7 @@ let activePopupHandle = null;
             // 世界书路径：仅在世界书模式下执行
             if (currentStorageMode === STORAGE_MODE_LOREBOOK && shouldUploadToLorebook && currentPrimaryLorebook) {
                 const lorebookEntries = await TavernHelper_API.getLorebookEntries(currentPrimaryLorebook);
+                requireCurrentChat(owner);
                 const existingSummaryEntry = lorebookEntries.find(
                     entry => entry.comment && entry.comment.startsWith(`${currentSummaryPrefix}${chatIdentifier}-`) && entry.enabled
                 );
@@ -5605,12 +5949,21 @@ let activePopupHandle = null;
                         combinedStartFloorDisplay = parseInt(nameParts[1]);
                         combinedEndFloorDisplay = Math.max(parseInt(nameParts[2]), endInternalId + 1);
                     }
-                    // When appending, do NOT add the introductory text again.
-                    // 【90修改】楼层前缀[起始层-结束层]
-                    const separator = `\n---\n[${startInternalId + 1}-${endInternalId + 1}]\n`;
-                    finalContentForLorebook = existingSummaryEntry.content + separator + summaryText;
+                    var oldSegments = lorebookSummarySegments(existingSummaryEntry);
+                    var oldSegment = oldSegments.find(s => s.startFloor === startInternalId && s.endFloor === endInternalId);
+                    if (oldSegments.some(s => s !== oldSegment && s.startFloor <= endInternalId && s.endFloor >= startInternalId)) {
+                        throw new Error('该楼层与已有世界书总结区间重叠，请先删除对应总结再重跑。');
+                    }
+                    var newSegment = { layerId, startFloor: startInternalId, endFloor: endInternalId, text: summaryText };
+                    if (oldSegment) oldSegments[oldSegments.indexOf(oldSegment)] = newSegment;
+                    else oldSegments.push(newSegment);
+                    oldSegments.sort((a, b) => a.startFloor - b.startFloor);
+                    combinedStartFloorDisplay = oldSegments[0].startFloor + 1;
+                    combinedEndFloorDisplay = Math.max(...oldSegments.map(s => s.endFloor)) + 1;
+                    finalContentForLorebook = threadPrefix(readChatMemory().threadNodes)
+                        + (currentLorebookHeaderText || DEFAULT_LOREBOOK_HEADER_TEXT) + '\n\n'
+                        + oldSegments.map(s => '---\n[' + (s.startFloor + 1) + '-' + (s.endFloor + 1) + ']\n' + s.text).join('\n');
                     finalEntryName = `${currentSummaryPrefix}${chatIdentifier}-${combinedStartFloorDisplay}-${combinedEndFloorDisplay}`;
-
                     await TavernHelper_API.setLorebookEntries(currentPrimaryLorebook, [{
                         uid: finalEntryUid, comment: finalEntryName, content: finalContentForLorebook,
                         enabled: true, type: 'constant',
@@ -5622,7 +5975,9 @@ let activePopupHandle = null;
                     showToastr("success", `${floorRangeText} 的${selectedSummaryType === 'small' ? '小总结' : '大总结'}已追加到现有世界书条目！`);
                 } else {
                     // This is a NEW entry, so prepend the introductory text.
-                    finalContentForLorebook = (currentLorebookHeaderText || DEFAULT_LOREBOOK_HEADER_TEXT) + "\n\n" + summaryText;
+                    finalContentForLorebook = threadPrefix(readChatMemory().threadNodes)
+                        + (currentLorebookHeaderText || DEFAULT_LOREBOOK_HEADER_TEXT) + '\n\n'
+                        + '---\n[' + (startInternalId + 1) + '-' + (endInternalId + 1) + ']\n' + summaryText;
                     finalEntryName = `${currentSummaryPrefix}${chatIdentifier}-${combinedStartFloorDisplay}-${combinedEndFloorDisplay}`;
                     const entryData = {
                         comment: finalEntryName, content: finalContentForLorebook,
@@ -5645,10 +6000,19 @@ let activePopupHandle = null;
                 // For simplicity, if not uploading, we don't prepend INTRO here, as it's mainly for AI in lorebook.
                 finalEntryName = `本地摘要 (${chatIdentifier} 楼 ${startInternalId+1}-${endInternalId+1})`;
             }
+            requireCurrentChat(owner);
+            // 总结已保存后才编织；脉络失败不能把总结流程判为失败。
+            try {
+                await weaveThreadForSummary(layerId, summaryText, requestOptions, owner);
+            } catch (threadError) {
+                showToastr('warning', '总结已完成，脉络更新失败：' + threadError.message);
+            }
+            requireCurrentChat(owner);
             for (let i = startInternalId; i <= endInternalId; i++) {
                 if (allChatMessages[i]) allChatMessages[i].summarized = true;
             }
             const chunkInfo = {
+                layerId,
                 startId: startInternalId, endId: endInternalId,
                 startOriginalId: allChatMessages[startInternalId]?.original_message_id,
                 endOriginalId: allChatMessages[endInternalId]?.original_message_id,
@@ -5671,6 +6035,7 @@ let activePopupHandle = null;
             }
             const finalStatusMsg = `操作完成: ${floorRangeText} 已总结${statusSuffix}。`;
             if($statusMessageSpan) $statusMessageSpan.text(finalStatusMsg);
+            isSummaryInFlight = false;
             await checkAndRunAutoCompress();
             return true;
         } catch (error) {
@@ -5680,6 +6045,8 @@ let activePopupHandle = null;
             showToastr("error", `总结失败 (${floorRangeText}): ${lastSummaryErrorMessage}`);
             if($statusMessageSpan) $statusMessageSpan.text(errorMsg);
             return false;
+        } finally {
+            isSummaryInFlight = false;
         }
     }
 
