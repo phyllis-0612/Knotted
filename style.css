@@ -760,3 +760,20 @@
         transition-duration: 0.01ms !important;
     }
 }
+
+#chatSummarizerWorldbookAdv-popup .thread-editor {
+    display: grid;
+    gap: 8px;
+    margin: 12px 0;
+    padding-top: 16px;
+    border-top: 1px solid var(--line-soft);
+}
+
+#chatSummarizerWorldbookAdv-popup .thread-editor textarea {
+    min-height: 160px;
+    line-height: 1.65;
+}
+
+#chatSummarizerWorldbookAdv-popup .thread-editor .button-group {
+    flex-wrap: wrap;
+}
