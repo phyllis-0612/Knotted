@@ -63,6 +63,16 @@ function harness() {
             rebuild: rebuildThread, saveEdited: saveEditedThread, parseEdited: parseEditedThread,
             parse: parseThreadOutput, lorebookSegments: lorebookSummarySegments,
             call: callCustomOpenAI, compress: runCompression, restore: restoreMemoryFromBackup,
+            prepareCompression: prepareCompressionPlan, restoreCompression: restoreCompressionBackup,
+            hasBackup: hasCompressBackup, autoCompress: checkAndRunAutoCompress,
+            summaryType: function (type) { selectedSummaryType = type; },
+            book: function (name) { currentPrimaryLorebook = name; },
+            compressionSettings: function (settings) {
+                if ('fresh' in settings) currentFreshCount = settings.fresh;
+                if ('floor' in settings) currentCompressFloorChars = settings.floor;
+                if ('auto' in settings) autoCompressEnabled = settings.auto;
+                if ('threshold' in settings) currentCompressThreshold = settings.threshold;
+            },
             threadOptions: getThreadRequestOptions, deleteProfile: deleteCurrentApiProfile,
             remove: function (ids) {
                 var m = readChatMemory();
@@ -98,7 +108,7 @@ function harness() {
     const plugin = window.testApi;
     plugin.setup(context, helper, text => toasts.push(text));
     return {
-        plugin, api, context, entries, requests, replies, toasts, settings, injections, events,
+        plugin, api, context, helper, entries, requests, replies, toasts, settings, injections, events,
         get metadata() { return metadata; }, get saves() { return saves; },
         switchChat(name, next = {}) { metadata = next; plugin.switchChat(name); }
     };
@@ -432,6 +442,271 @@ test('自定义头部是默认头部前半句时，清理完整默认说明而�
     assert.equal(await p.summary(0, 9, false), true);
     assert.equal(p.read().segments[0].text, '正文');
     assert.ok(!p.build().includes('[System Note:'));
+});
+
+async function worldCompressionFixture(separate = false) {
+    const h = harness(), p = h.plugin;
+    p.mode('lorebook');
+    const bodies = ['初遇的剧情'.repeat(30), '相爱的剧情'.repeat(30), '最后一段保鲜剧情'];
+    const entry = (uid, start, end, content) => ({ uid, enabled: true, type: 'constant', keys: ['keep'],
+        position: 'before_character_definition', order: uid, comment: '小总结-Chat-A-' + start + '-' + end, content });
+    if (separate) h.entries.push(...bodies.map((body, i) => entry(i + 1, i * 10 + 1, i * 10 + 10,
+        '---\n[' + (i * 10 + 1) + '-' + (i * 10 + 10) + ']\n' + body)));
+    else h.entries.push(entry(1, 1, 30, bodies.map((body, i) => '---\n[' + (i * 10 + 1) + '-' + (i * 10 + 10) + ']\n' + body).join('\n')));
+    h.entries.push({ uid: 10, enabled: false, comment: '大总结-Chat-A-1-30', content: '大总结保持' },
+        { uid: 11, enabled: false, comment: '小总结-Chat-B-1-10', content: '其他聊天保持' },
+        { uid: 12, enabled: true, comment: '设定', content: '普通条目保持' });
+    p.write({ ...p.read(), segments: [{ layerId: 'inject_90_99', startFloor: 90, endFloor: 99, gen: 0, text: '注入记忆保持' }],
+        threadNodes: bodies.map((_, i) => ({ id: 'n' + i, layerId: 'summary_' + i * 10 + '_' + (i * 10 + 9), text: '[日' + i + '] 事件' })) });
+    await p.syncMemory();
+    return h;
+}
+
+for (const separate of [false, true]) test('世界书压缩' + (separate ? '多个条目' : '单条多段') + '，保鲜、脉络、属性和其他记忆不变，撤销可恢复', async () => {
+    const h = await worldCompressionFixture(separate), p = h.plugin;
+    const original = clone(h.entries), nodes = clone(p.read().threadNodes), inject = clone(p.read().segments);
+    const plan = await p.prepareCompression();
+    assert.equal(plan.ok, true);
+    assert.equal(plan.toCompress.length, 2);
+    assert.equal(plan.fresh.length, 1);
+    h.replies.push(jsonResponse(p.summaryHeader + '\n\n初遇后相爱'));
+    const result = await p.compress();
+    assert.equal(result.ok, true);
+    assert.equal(result.after, '初遇后相爱'.length + '最后一段保鲜剧情'.length);
+    const active = h.entries.filter(e => e.enabled && e.comment.startsWith('小总结-Chat-A-'));
+    assert.equal(active.length, 1);
+    assert.deepEqual(clone(p.lorebookSegments(active[0]).map(s => [s.gen, s.startFloor, s.endFloor, s.text])),
+        [[1, 0, 19, '初遇后相爱'], [0, 20, 29, '最后一段保鲜剧情']]);
+    assert.equal(active[0].content.split(p.summaryHeader).length - 1, 1);
+    assert.deepEqual(clone(p.read().threadNodes), nodes);
+    assert.deepEqual(clone(p.read().segments), inject);
+    assert.deepEqual(clone(h.entries.slice(separate ? 3 : 1)), original.slice(separate ? 3 : 1));
+    assert.deepEqual(active[0].keys, ['keep']);
+    await p.manageLorebook(); // 重开聊天/切换总结类型不能重新启用压缩前的旧条目。
+    assert.equal(h.entries.filter(e => e.enabled && e.comment.startsWith('小总结-Chat-A-')).length, 1);
+    assert.equal((await p.prepareCompression()).source.segments.length, 2);
+    assert.ok(p.hasBackup());
+    assert.ok(!h.requests[0].body.messages[1].content.includes(p.summaryHeader));
+    assert.ok(!h.requests[0].body.messages[1].content.includes('最后一段保鲜剧情'));
+    assert.ok(!h.requests[0].body.messages[1].content.includes('注入记忆保持'));
+    await p.saveEdited('[人工] 我的脉络');
+    assert.equal(await p.restoreCompression(), 3);
+    assert.equal(p.read().threadNodes[0].text, '[人工] 我的脉络');
+    assert.deepEqual(clone(p.read().segments), inject);
+    assert.deepEqual(clone(p.lorebookSegments(h.entries[0]).map(s => s.text)),
+        separate ? ['初遇的剧情'.repeat(30)] : ['初遇的剧情'.repeat(30), '相爱的剧情'.repeat(30), '最后一段保鲜剧情']);
+    assert.deepEqual(clone(h.entries.slice(separate ? 3 : 1)), original.slice(separate ? 3 : 1));
+});
+
+test('世界书压缩后追加、再次压缩、重建和删除压缩段保留完整来源关联', async () => {
+    const h = await worldCompressionFixture(), p = h.plugin;
+    h.replies.push(jsonResponse('压缩一'));
+    assert.equal((await p.compress()).ok, true);
+    h.replies.push(jsonResponse('新段'), jsonResponse('[新] 新事件'));
+    assert.equal(await p.summary(30, 39, true), true);
+    assert.equal(p.lorebookSegments(h.entries[0])[0].gen, 1);
+    // 追加后拒绝旧备份覆盖新总结。
+    assert.equal(await p.restoreCompression(), -1);
+    assert.ok(h.entries[0].content.includes('新段'));
+    p.compressionSettings({ floor: 0 });
+    const nodes = clone(p.read().threadNodes);
+    h.replies.push(jsonResponse('压缩二'));
+    assert.equal((await p.compress()).ok, true);
+    const segments = p.lorebookSegments(h.entries[0]);
+    assert.equal(segments[0].gen, 2);
+    assert.equal(segments[0].endFloor, 29);
+    assert.ok(segments[0].sourceLayerIds.includes('summary_0_9'));
+    assert.ok(segments[0].sourceLayerIds.includes('summary_10_19'));
+    assert.deepEqual(clone(p.read().threadNodes), nodes);
+    h.replies.push(jsonResponse('[旧] 合并事件'), jsonResponse('[新] 新段事件'));
+    assert.equal(await p.rebuild(), true);
+    assert.ok(h.requests[h.requests.length - 2].body.messages[1].content.endsWith('压缩二'));
+    h.entries[0].content = '---\n[31-40]\n新段';
+    await p.maxLorebookFloor();
+    assert.deepEqual(clone(p.read().threadNodes.map(n => n.layerId)), ['summary_30_39']);
+});
+
+test('世界书压缩 API 或备份失败不会改写条目；部分写入失败自动恢复', async () => {
+    const h = await worldCompressionFixture(true), p = h.plugin, original = clone(h.entries);
+    h.replies.push(new Response('offline', { status: 503 }));
+    assert.equal((await p.compress()).ok, false);
+    assert.deepEqual(h.entries, original);
+    h.context.saveMetadataDebounced = () => { throw new Error('save failed'); };
+    assert.equal((await p.compress()).ok, false);
+    assert.equal(h.requests.length, 1);
+    assert.deepEqual(h.entries, original);
+    h.context.saveMetadataDebounced = () => {};
+    const write = h.helper.setLorebookEntries;
+    let fail = true;
+    h.helper.setLorebookEntries = async (book, changes) => {
+        if (fail) { fail = false; await write(book, changes.slice(0, 1)); throw new Error('partial write'); }
+        return write(book, changes);
+    };
+    h.replies.push(jsonResponse('压缩'));
+    assert.equal((await p.compress()).ok, false);
+    assert.deepEqual(h.entries, original);
+    assert.equal(p.read().threadNodes.length, 3);
+});
+
+test('世界书压缩过程中编辑、切换聊天、世界书或总结类型时不覆盖新的内容', async () => {
+    for (const change of ['edit', 'chat', 'book', 'type']) {
+        const h = await worldCompressionFixture(), p = h.plugin;
+        h.replies.push(() => {
+            if (change === 'edit') h.entries[0].content += '\n用户修改';
+            if (change === 'chat') h.switchChat('Chat-B');
+            if (change === 'book') p.book('Another-Book');
+            if (change === 'type') p.summaryType('large');
+            return jsonResponse('旧任务压缩');
+        });
+        assert.equal((await p.compress()).ok, false);
+        assert.ok(!h.entries[0].content.includes('旧任务压缩'));
+        if (change === 'edit') assert.ok(h.entries[0].content.includes('用户修改'));
+    }
+});
+
+test('世界书自动压缩按世界书正文阈值触发并使用独立压缩预设', async () => {
+    const h = await worldCompressionFixture(), p = h.plugin;
+    h.entries[0].content += '很长的剧情'.repeat(250);
+    h.settings.autoSummaryWorldbookAdv.apiProfiles.push({ id: 'compress-only', name: '压缩', model: 'compress-model',
+        url: 'https://compress.test/v1', apiKey: 'compress-test-only' });
+    h.settings.autoSummaryWorldbookAdv.compressProfileId = 'compress-only';
+    p.compressionSettings({ auto: true, threshold: 1000 });
+    h.replies.push(jsonResponse('自动压缩'));
+    await p.autoCompress();
+    assert.equal(h.requests[0].url, 'https://compress.test/v1/chat/completions');
+    assert.equal(h.requests[0].body.model, 'compress-model');
+    assert.ok(h.entries[0].content.includes('自动压缩'));
+    assert.equal(p.read().segments[0].text, '注入记忆保持');
+});
+
+test('世界书保底段和楼层空隙不会被包进重叠压缩区间', async () => {
+    const h = await worldCompressionFixture(), p = h.plugin;
+    h.entries[0].comment = '小总结-Chat-A-1-60';
+    h.entries[0].content = '---\n[1-10]\n一\n---\n[已压缩·1代 11-20]\n保底\n---\n[21-30]\n三\n---\n[31-40]\n四\n---\n[51-60]\n保鲜';
+    const plan = await p.prepareCompression();
+    assert.deepEqual(clone(plan.toCompress.map(s => [s.startFloor, s.endFloor])), [[20, 29], [30, 39]]);
+    h.replies.push(jsonResponse('三四合并'));
+    assert.equal((await p.compress()).ok, true);
+    assert.deepEqual(clone(p.lorebookSegments(h.entries[0]).map(s => [s.startFloor, s.endFloor])), [[0, 9], [10, 19], [20, 39], [50, 59]]);
+});
+
+test('压缩失败保留上一次成功的世界书备份，撤销与模式、聊天、世界书、总结类型隔离', async () => {
+    const h = await worldCompressionFixture(), p = h.plugin;
+    h.replies.push(jsonResponse('第一次压缩'));
+    assert.equal((await p.compress()).ok, true);
+    assert.ok(p.hasBackup());
+    p.mode('inject'); assert.equal(p.hasBackup(), false);
+    p.mode('lorebook'); p.book('另一本'); assert.equal(p.hasBackup(), false);
+    p.book('Book'); p.summaryType('large'); assert.equal(p.hasBackup(), false);
+    p.summaryType('small'); assert.ok(p.hasBackup());
+    const raw = clone(h.metadata), originalEntries = clone(h.entries);
+    const previousBackup = clone(h.metadata.autoSummaryAdv_v1_backup_lorebook);
+    h.entries[0].comment = '小总结-Chat-A-1-40';
+    h.entries[0].content += '\n---\n[31-40]\n新保鲜段';
+    p.compressionSettings({ floor: 0 });
+    h.replies.push(new Response('offline', { status: 503 }));
+    assert.equal((await p.compress()).ok, false);
+    assert.deepEqual(clone(h.metadata.autoSummaryAdv_v1_backup_lorebook), previousBackup);
+    const reloaded = harness();
+    Object.assign(reloaded.metadata, raw); reloaded.entries.push(...originalEntries);
+    reloaded.plugin.mode('lorebook');
+    assert.equal(reloaded.plugin.lorebookSegments(reloaded.entries[0])[0].gen, 1);
+    assert.ok(reloaded.plugin.lorebookSegments(reloaded.entries[0])[0].sourceLayerIds.includes('summary_10_19'));
+    assert.equal(await reloaded.plugin.restoreCompression(), 3);
+    assert.equal(reloaded.plugin.read().threadNodes.length, 3);
+    assert.equal(reloaded.plugin.hasBackup(), false);
+    h.switchChat('Chat-B'); assert.equal(p.hasBackup(), false);
+});
+
+test('世界书自动压缩在本轮总结保存之后调用，失败不影响总结成功', async () => {
+    const h = await worldCompressionFixture(), p = h.plugin;
+    h.entries[0].content += '很长的剧情'.repeat(250);
+    p.compressionSettings({ auto: true, threshold: 1000 });
+    h.replies.push(jsonResponse('本轮总结'), jsonResponse('[本轮] 事件'), new Response('offline', { status: 503 }));
+    assert.equal(await p.summary(30, 39, true), true);
+    assert.equal(h.requests.length, 3);
+    assert.ok(h.entries[0].content.includes('本轮总结'));
+    assert.equal(p.lorebookSegments(h.entries[0]).length, 4);
+});
+
+test('世界书区间重叠、主世界书缺失和可压缩段不足不会请求模型', async () => {
+    const h = await worldCompressionFixture(), p = h.plugin;
+    h.entries.push({ uid: 20, comment: '小总结-Chat-A-5-15', enabled: true, content: '重叠总结' });
+    assert.equal((await p.compress()).ok, false);
+    h.entries.pop();
+    p.book(null); assert.equal((await p.compress()).ok, false);
+    p.book('Book'); p.compressionSettings({ fresh: 2 });
+    assert.equal((await p.compress()).ok, false);
+    assert.equal(h.requests.length, 0);
+});
+
+test('世界书压缩和撤销期间使用互斥锁，第二次任务不会发起调用', async () => {
+    const h = await worldCompressionFixture(), p = h.plugin, hold = deferred(), sent = deferred();
+    h.replies.push(() => { sent.resolve(); return hold.promise; });
+    const work = p.compress();
+    await sent.promise;
+    assert.equal((await p.compress()).ok, false);
+    assert.equal(await p.restoreCompression(), -1);
+    assert.equal(await p.summary(30, 39, true), false);
+    hold.resolve(jsonResponse('压缩结果'));
+    assert.equal((await work).ok, true);
+    assert.equal(h.requests.length, 1);
+});
+
+test('世界书撤销部分写入失败时恢复压缩后的条目，并保留可重试备份', async () => {
+    const h = await worldCompressionFixture(true), p = h.plugin;
+    h.replies.push(jsonResponse('已压缩'));
+    assert.equal((await p.compress()).ok, true);
+    const compressed = clone(h.entries), write = h.helper.setLorebookEntries;
+    let fail = true;
+    h.helper.setLorebookEntries = async (book, changes) => {
+        if (fail) { fail = false; await write(book, changes.slice(0, 1)); throw new Error('partial undo'); }
+        return write(book, changes);
+    };
+    assert.equal(await p.restoreCompression(), -1);
+    assert.deepEqual(h.entries, compressed);
+    assert.ok(p.hasBackup());
+    assert.equal(await p.restoreCompression(), 3);
+    assert.equal(p.hasBackup(), false);
+});
+
+test('世界书大总结可压缩，小总结和其他类型的来源关联不变', async () => {
+    const h = await worldCompressionFixture(), p = h.plugin;
+    h.entries[0].enabled = false;
+    const large = h.entries.find(e => e.uid === 10);
+    large.enabled = true;
+    large.content = '---\n[1-10]\n大一\n---\n[11-20]\n大二\n---\n[21-30]\n大三';
+    p.summaryType('large');
+    const small = clone(h.entries[0]);
+    h.replies.push(jsonResponse('大总结压缩'));
+    assert.equal((await p.compress()).ok, true);
+    assert.deepEqual(h.entries[0], small);
+    assert.equal(p.lorebookSegments(large)[0].gen, 1);
+    assert.equal(await p.restoreCompression(), 3);
+});
+
+for (const action of ['compress', 'undo']) test('世界书' + action + '写入失败时的自动恢复保留期间手改的脉络', async () => {
+    const h = await worldCompressionFixture(true), p = h.plugin;
+    if (action === 'undo') {
+        h.replies.push(jsonResponse('已压缩'));
+        assert.equal((await p.compress()).ok, true);
+    }
+    const write = h.helper.setLorebookEntries;
+    let fail = true;
+    h.helper.setLorebookEntries = async (book, changes) => {
+        if (fail) {
+            fail = false; await write(book, changes.slice(0, 1));
+            await p.saveEdited('[人工] 最终事件线');
+            throw new Error('partial write after manual edit');
+        }
+        return write(book, changes);
+    };
+    if (action === 'compress') {
+        h.replies.push(jsonResponse('失败的压缩'));
+        assert.equal((await p.compress()).ok, false);
+    } else assert.equal(await p.restoreCompression(), -1);
+    assert.equal(p.read().threadNodes[0].text, '[人工] 最终事件线');
+    assert.ok(h.entries.filter(e => e.enabled && e.comment.startsWith('小总结-Chat-A-')).some(e => e.content.includes('[人工] 最终事件线')));
 });
 
 test('部分重叠范围在调用前拒绝，避免总结和节点重复', async () => {
