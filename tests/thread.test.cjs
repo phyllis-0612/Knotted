@@ -72,6 +72,9 @@ function harness() {
             },
             summary: proceedWithSummarization, initialize: mainInitializeSummarizer,
             maxLorebookFloor: getMaxSummarizedFloorFromActiveLorebookEntry,
+            syncMemory: syncThreadInjection, manageLorebook: manageSummaryLorebookEntries,
+            setSummaryHeader: function (text) { currentLorebookHeaderText = text; },
+            get summaryHeader() { return DEFAULT_LOREBOOK_HEADER_TEXT; },
             initEvents: function () { window.jQuery = () => ({ length: 0 }); mainInitializeSummarizer(); },
             get header() { return THREAD_HEADER; },
             get locks() { return { isSummaryInFlight, isRebuildingThread }; },
@@ -320,6 +323,115 @@ test('旧版世界书首段无标记时从条目范围与后一段标记恢复',
     const h = harness();
     const segments = h.plugin.lorebookSegments({ comment: '小总结-Chat-A-1-20', content: '第一段\n---\n[11-20]\n第二段' });
     assert.deepEqual(clone(segments.map(s => [s.startFloor, s.endFloor, s.text])), [[0, 9, '第一段'], [10, 19, '第二段']]);
+});
+
+for (const mode of ['lorebook', 'inject']) test(mode + '连续小总结只在整份记忆开头放一次说明，单段与脉络请求不包含抬头', async () => {
+    const h = harness(), p = h.plugin, header = p.summaryHeader;
+    p.mode(mode);
+    for (let i = 0; i < 3; i++) {
+        h.replies.push(jsonResponse(header + '\n\n' + header + '\n\n正文' + i), jsonResponse('[阶段' + i + '] 事件'));
+        assert.equal(await p.summary(i * 10, i * 10 + 9, mode === 'lorebook'), true);
+    }
+    const content = mode === 'lorebook' ? h.entries[0].content : p.build();
+    assert.equal(content.split(header).length - 1, 1);
+    assert.ok(content.indexOf(header) < content.indexOf('正文0'));
+    const segments = mode === 'lorebook' ? p.lorebookSegments(h.entries[0]) : p.read().segments;
+    assert.deepEqual(clone(segments.map(s => s.text)), ['正文0', '正文1', '正文2']);
+    h.requests.filter((_, i) => i % 2).forEach((request, i) => {
+        assert.equal(request.body.messages[1].content.split('【最新总结】\n')[1], '正文' + i);
+    });
+});
+
+test('世界书旧数据在首段、分隔符前后重复的说明被清理，范围和正文保留', async () => {
+    const h = harness(), p = h.plugin, header = p.summaryHeader;
+    p.mode('lorebook');
+    h.entries.push({ uid: 1, enabled: true, comment: '小总结-Chat-A-1-20',
+        content: header + '\n\n旧段一\n\n' + header + '\n\n---\n[11-20]\n' + header + '\n\n旧段二' });
+    assert.equal(await p.maxLorebookFloor(), 19);
+    assert.deepEqual(clone(p.lorebookSegments(h.entries[0]).map(s => [s.startFloor, s.endFloor, s.text])),
+        [[0, 9, '旧段一'], [10, 19, '旧段二']]);
+    assert.equal(h.entries[0].content.split(header).length - 1, 1);
+    // 再次加载及后续追加都不会把已去掉的说明加回来。
+    await p.maxLorebookFloor();
+    h.replies.push(jsonResponse('新段三'), () => { throw new Error('thread offline'); });
+    assert.equal(await p.summary(20, 29, true), true);
+    assert.equal(h.entries[0].content.split(header).length - 1, 1);
+    assert.deepEqual(clone(p.lorebookSegments(h.entries[0]).map(s => s.text)), ['旧段一', '旧段二', '新段三']);
+});
+
+test('多个启用的世界书总结块共用一个抬头，其他聊天、类型与普通条目不改写', async () => {
+    const h = harness(), p = h.plugin, header = p.summaryHeader;
+    p.mode('lorebook');
+    h.entries.push(
+        { uid: 1, enabled: true, comment: '小总结-Chat-A-1-10', content: header + '\n\n---\n[1-10]\n一', keys: ['keep'], order: 12 },
+        { uid: 2, enabled: true, comment: '小总结-Chat-A-11-20', content: header + '\n\n---\n[11-20]\n二', order: 13 },
+        { uid: 3, enabled: true, comment: '小总结-Chat-B-1-10', content: header + '\n\n其他聊天' },
+        { uid: 4, enabled: false, comment: '大总结-Chat-A-1-20', content: header + '\n\n其他类型' },
+        { uid: 5, enabled: true, comment: '人物设定', content: header + '\n\n普通条目' }
+    );
+    const others = clone(h.entries.slice(2));
+    await p.syncMemory();
+    assert.equal(h.entries.slice(0, 2).map(e => e.content).join('\n').split(header).length - 1, 1);
+    assert.deepEqual(clone(h.entries.slice(2)), others);
+    assert.deepEqual(h.entries[0].keys, ['keep']);
+    assert.equal(h.entries[0].order, 12);
+    const first = clone(h.entries);
+    await p.syncMemory();
+    assert.deepEqual(h.entries, first);
+});
+
+test('注入旧段与自定义说明去重，正文中的行内引用和楼层标签保留', () => {
+    const h = harness(), p = h.plugin, header = '自定义说明 [.*] {{char}}\n仅作时间线参考';
+    p.setSummaryHeader(header);
+    const quote = '角色读到“' + p.summaryHeader.split('\n')[0] + '”，继续讲述。';
+    h.metadata.autoSummaryAdv_v1 = { header, segments: [
+        { startFloor: 0, endFloor: 9, gen: 0, text: header + '\r\n\r\n' + quote },
+        { startFloor: 10, endFloor: 19, gen: 2, text: p.summaryHeader + '\n\n第二段' }
+    ] };
+    const original = clone(h.metadata);
+    const content = p.build();
+    assert.equal(content.split(header).length - 1, 1);
+    assert.ok(content.includes(quote));
+    assert.ok(content.includes('[1-10]'));
+    assert.ok(content.includes('11-20]'));
+    assert.ok(content.includes('第二段'));
+    assert.deepEqual(h.metadata, original); // 构造注入文本不原地更改旧数据。
+});
+
+test('只有抬头的模型响应不被保存成有效总结', async () => {
+    const h = harness();
+    h.replies.push(jsonResponse(h.plugin.summaryHeader));
+    assert.equal(await h.plugin.summary(0, 9, false), false);
+    assert.equal(h.plugin.read().segments.length, 0);
+    assert.equal(h.requests.length, 1);
+});
+
+test('压缩、撤销及旧注入记忆重建脉络均只处理剧情正文', async () => {
+    const h = harness(), p = h.plugin, header = p.summaryHeader;
+    h.metadata.autoSummaryAdv_v1 = { segments: [0, 1, 2].map(i => ({
+        startFloor: i * 10, endFloor: i * 10 + 9, gen: 0, text: header + '\n\n剧情' + i
+    })) };
+    h.replies.push(jsonResponse(header + '\n\n合并剧情'));
+    assert.equal((await p.compress()).ok, true);
+    assert.ok(!h.requests[0].body.messages[1].content.includes(header));
+    assert.equal(p.read().segments[0].text, '合并剧情');
+    assert.equal(p.build().split(header).length - 1, 1);
+    assert.equal(p.restore(), 3);
+    assert.deepEqual(clone(p.read().segments.map(s => s.text)), ['剧情0', '剧情1', '剧情2']);
+    // 模拟尚未保存过的旧元数据，重建调用也不携带重复说明。
+    h.metadata.autoSummaryAdv_v1.segments[0].text = header + '\n\n剧情0';
+    h.replies.push(jsonResponse('[一] 剧情0'), jsonResponse('[二] 剧情1'), jsonResponse('[三] 剧情2'));
+    assert.equal(await p.rebuild(), true);
+    h.requests.slice(1).forEach(request => assert.ok(!request.body.messages[1].content.includes(header)));
+});
+
+test('自定义头部是默认头部前半句时，清理完整默认说明而不遗留 System Note', async () => {
+    const h = harness(), p = h.plugin;
+    p.setSummaryHeader(p.summaryHeader.split('\n')[0]);
+    h.replies.push(jsonResponse(p.summaryHeader + '\n\n正文'), jsonResponse('[日] 事件'));
+    assert.equal(await p.summary(0, 9, false), true);
+    assert.equal(p.read().segments[0].text, '正文');
+    assert.ok(!p.build().includes('[System Note:'));
 });
 
 test('部分重叠范围在调用前拒绝，避免总结和节点重复', async () => {

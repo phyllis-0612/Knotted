@@ -101,7 +101,7 @@ let activePopupHandle = null;
 （严格控制在 1-2 句话内。无需重复举例事实，直接提炼本阶段双人关系的实质位移与核心心理结论）
 *   **心理与关系位移**：（精准概括结论，禁止使用"感情升温"等抽象烂梗。例如：A的防备被彻底打破，B的试探得到默许，两人关系从单向入侵转为无声的底线让步。）`;
 
-    // --- 剧情总结写入世界书时的头部说明（可在插件内编辑） ---
+    // --- 整份记忆的头部说明（世界书与注入模式共用，正文只保留剧情） ---
     const DEFAULT_LOREBOOK_HEADER_TEXT = `以下是本故事的历史总结
 [System Note: 以下总结仅作为剧情事实与时间线参考，不构成文风样本。仅参考事件，不套用文风。]`;
 
@@ -1775,7 +1775,8 @@ let activePopupHandle = null;
             const owner = captureChat();
             const entries = await TavernHelper_API.getLorebookEntries(currentPrimaryLorebook);
             requireCurrentChat(owner);
-            if (reconcileLorebookThread(entries)) await syncThreadInjection(owner);
+            // 即使脉络未变，也要清理旧总结中重复的头部说明。
+            await syncThreadInjection(owner, entries);
             let maxFloor = -1;
             // Determine the prefix based on the currently selected summary type
             const currentPrefix = selectedSummaryType === 'small' ? SUMMARY_LOREBOOK_SMALL_PREFIX : SUMMARY_LOREBOOK_LARGE_PREFIX;
@@ -3126,8 +3127,8 @@ let activePopupHandle = null;
                                     </div>
                                 </div>
                                 <div>
-                                    <label for="${SCRIPT_ID_PREFIX}-lorebook-header-textarea">世界书头部说明</label>
-                                    <textarea id="${SCRIPT_ID_PREFIX}-lorebook-header-textarea" rows="3" placeholder="写入世界书条目前的说明文字。"></textarea>
+                                    <label for="${SCRIPT_ID_PREFIX}-lorebook-header-textarea">记忆头部说明（整份记忆仅一次）</label>
+                                    <textarea id="${SCRIPT_ID_PREFIX}-lorebook-header-textarea" rows="3" placeholder="世界书与注入模式共用，只放在全部总结正文之前。"></textarea>
                                     <div class="button-group" style="margin-top:0.75rem;">
                                         <button id="${SCRIPT_ID_PREFIX}-reset-lorebook-header" class="button button-secondary">恢复默认说明</button>
                                         <button id="${SCRIPT_ID_PREFIX}-save-lorebook-header" class="button button-primary">保存</button>
@@ -4595,7 +4596,9 @@ let activePopupHandle = null;
 
         logDebug(`管理世界书 "${currentPrimaryLorebook}" 中的总结条目，针对聊天: ${currentChatFileIdentifier}, 选择类型: ${selectedSummaryType}`);
         try {
+            const owner = captureChat();
             const entries = await TavernHelper_API.getLorebookEntries(currentPrimaryLorebook);
+            requireCurrentChat(owner);
             const entriesToUpdate = [];
 
             const smallPrefixPattern = new RegExp(`^${escapeRegex(SUMMARY_LOREBOOK_SMALL_PREFIX)}${escapeRegex(currentChatFileIdentifier)}-\\d+-\\d+$`);
@@ -4646,6 +4649,7 @@ let activePopupHandle = null;
             } else {
                 logDebug("无需更新世界书总结条目的激活状态。");
             }
+            await syncThreadInjection(owner);
         } catch (error) {
             logError("管理世界书总结条目时出错: ", error);
             showToastr("error", "管理世界书总结条目失败。");
@@ -4712,6 +4716,20 @@ let activePopupHandle = null;
         return end < 0 ? '' : content.slice(end + 2);
     }
 
+    // 只移除完整、独占行的已知说明块，避免误删正文中的行内引用。
+    // 对旧数据在段首、段尾和分隔符附近的重复说明同样生效；兼容 CRLF。
+    function stripSummaryHeaders(content, extraHeaders = []) {
+        var headers = [...new Set([...extraHeaders, currentLorebookHeaderText, DEFAULT_LOREBOOK_HEADER_TEXT]
+            .filter(h => typeof h === 'string' && h.trim()).map(h => h.trim()))]
+            .sort((a, b) => b.length - a.length);
+        var body = String(content || '');
+        for (var header of headers) {
+            var pattern = header.split(/\r?\n/).map(escapeRegex).join('\\r?\\n');
+            body = body.replace(new RegExp('^' + pattern + '(?:\\r?\\n|$)', 'gm'), '');
+        }
+        return body.trim();
+    }
+
     function parseThreadOutput(text) {
         return String(text || '').split(/\r?\n/).map(line => line.trim())
             .filter(line => line.startsWith('[') && line.includes(']'));
@@ -4721,10 +4739,7 @@ let activePopupHandle = null;
     function lorebookSummarySegments(entry) {
         var range = (entry.comment || '').match(/-(\d+)-(\d+)$/);
         if (!range) return [];
-        var body = stripThreadPrefix(entry.content || '');
-        for (var header of [currentLorebookHeaderText, DEFAULT_LOREBOOK_HEADER_TEXT]) {
-            if (header && body.startsWith(header + '\n\n')) { body = body.slice(header.length + 2); break; }
-        }
+        var body = stripSummaryHeaders(stripThreadPrefix(entry.content || ''), [readChatMemory().header]);
         var markers = [...body.matchAll(/(?:^|\n)---\r?\n\[(\d+)-(\d+)\]\r?\n/g)];
         var segments = [];
         function add(start, end, text) {
@@ -4737,27 +4752,29 @@ let activePopupHandle = null;
         return segments;
     }
 
-    async function currentLorebookSummaryEntries() {
+    async function currentLorebookSummaryEntries(existingEntries) {
         if (!currentPrimaryLorebook || !TavernHelper_API?.getLorebookEntries) return [];
         var prefix = (selectedSummaryType === 'small' ? SUMMARY_LOREBOOK_SMALL_PREFIX : SUMMARY_LOREBOOK_LARGE_PREFIX)
             + currentChatFileIdentifier + '-';
-        return (await TavernHelper_API.getLorebookEntries(currentPrimaryLorebook))
+        return (existingEntries || await TavernHelper_API.getLorebookEntries(currentPrimaryLorebook))
             .filter(e => e.enabled && e.comment?.startsWith(prefix) && /-\d+-\d+$/.test(e.comment));
     }
 
-    async function syncThreadInjection(owner = captureChat()) {
+    async function syncThreadInjection(owner = captureChat(), existingEntries) {
         requireCurrentChat(owner);
         if (currentStorageMode === STORAGE_MODE_INJECT) { refreshInjection(); return; }
-        var entries = await currentLorebookSummaryEntries();
+        var entries = await currentLorebookSummaryEntries(existingEntries);
         requireCurrentChat(owner);
         reconcileLorebookThread(entries);
         if (!entries.length) return;
         entries.sort((a, b) => Number(b.comment.match(/-(\d+)-(\d+)$/)[2]) - Number(a.comment.match(/-(\d+)-(\d+)$/)[2]));
-        // 同样使用一个已有总结块：先移除旧前缀，再把最新脉络放在最完整的条目里。
-        var prefix = threadPrefix(readChatMemory().threadNodes);
-        await TavernHelper_API.setLorebookEntries(currentPrimaryLorebook, entries.map((e, i) => ({
-            ...e, content: (i === 0 ? prefix : '') + stripThreadPrefix(e.content || '')
-        })));
+        // 脉络与说明都是整份记忆的前缀，不能混进单段总结或重复在每个条目里。
+        var memory = readChatMemory();
+        var prefix = threadPrefix(memory.threadNodes) + (currentLorebookHeaderText || DEFAULT_LOREBOOK_HEADER_TEXT) + '\n\n';
+        var changes = entries.map((e, i) => ({
+            ...e, content: (i === 0 ? prefix : '') + stripSummaryHeaders(stripThreadPrefix(e.content || ''), [memory.header])
+        })).filter((e, i) => e.content !== entries[i].content);
+        if (changes.length) await TavernHelper_API.setLorebookEntries(currentPrimaryLorebook, changes);
         requireCurrentChat(owner);
     }
 
@@ -4861,7 +4878,9 @@ let activePopupHandle = null;
         isRebuildingThread = true;
         var completed = 0;
         try {
-            var segments = currentStorageMode === STORAGE_MODE_INJECT ? readChatMemory().segments
+            var segments = currentStorageMode === STORAGE_MODE_INJECT ? readChatMemory().segments.map(s => ({
+                ...s, text: stripSummaryHeaders(s.text, [readChatMemory().header])
+            }))
                 : (await currentLorebookSummaryEntries()).flatMap(lorebookSummarySegments);
             requireCurrentChat(owner);
             segments.sort((a, b) => a.startFloor - b.startFloor);
@@ -5024,6 +5043,10 @@ let activePopupHandle = null;
         if (!meta || typeof meta !== 'object') return false;
 
         if (!memory || typeof memory !== 'object') memory = makeEmptyMemory();
+        // 手动保存、压缩、撤销和后续写入也统一保存不带说明的总结正文。
+        memory.segments = (memory.segments || []).map(s => ({
+            ...s, text: stripSummaryHeaders(s.text, [memory.header])
+        }));
         memory.version = 1;
         memory.updatedAt = Date.now();
         var previous = meta[CHAT_META_KEY];
@@ -5125,7 +5148,7 @@ let activePopupHandle = null;
                 tag = '[' + (s.startFloor + 1) + '-' + (s.endFloor + 1) + ']';
             }
             parts.push(tag);
-            parts.push(s.text);
+            parts.push(stripSummaryHeaders(s.text, [head]));
             parts.push('');
         }
         return threadPrefix(mem.threadNodes) + parts.join('\n');
@@ -5342,7 +5365,7 @@ let activePopupHandle = null;
         for (var i = 0; i < segs.length; i++) {
             var s = segs[i];
             parts.push('【楼层 ' + (s.startFloor + 1) + '-' + (s.endFloor + 1) + '】');
-            parts.push(s.text);
+            parts.push(stripSummaryHeaders(s.text, [readChatMemory().header]));
             parts.push('');
         }
         return parts.join('\n');
@@ -5496,7 +5519,7 @@ let activePopupHandle = null;
 
             var compressCfg = getCompressApiConfig();
             logDebug('[压缩] 使用配置档:', (getCompressApiProfile() ? getCompressApiProfile().name : '无'), '模型:', compressCfg.model);
-            var compressed = await callCustomOpenAIWith(currentCompressPrompt, userPrompt, compressCfg);
+            var compressed = stripSummaryHeaders(await callCustomOpenAIWith(currentCompressPrompt, userPrompt, compressCfg), [readChatMemory().header]);
             requireCurrentChat(compressOwner);
             if (!compressed || compressed.trim() === '') {
                 throw new Error('AI 未返回有效的压缩内容。');
@@ -5572,7 +5595,7 @@ let activePopupHandle = null;
         for (var i = 0; i < mem.segments.length; i++) {
             var s = mem.segments[i];
             parts.push('### [' + s.gen + '] ' + s.startFloor + '-' + s.endFloor);
-            parts.push(s.text);
+            parts.push(stripSummaryHeaders(s.text, [mem.header]));
             parts.push('');
         }
         return parts.join('\n');
@@ -5954,7 +5977,7 @@ let activePopupHandle = null;
                 if (existingSegment) layerId = existingSegment.layerId;
             }
             // Note: callCustomOpenAI now internally combines currentBreakArmorPrompt and currentSummaryPrompt
-            const summaryText = await callCustomOpenAI(null, userPromptForSummarization, onStreamUpdate, requestOptions);
+            const summaryText = stripSummaryHeaders(await callCustomOpenAI(null, userPromptForSummarization, onStreamUpdate, requestOptions), [readChatMemory().header]);
             requireCurrentChat(owner);
             if (!summaryText || summaryText.trim() === "") { throw new Error("自定义AI未能生成有效的摘要。"); }
             logDebug(`自定义AI生成的摘要 (${floorRangeText}):\n${summaryText}`);
@@ -6050,6 +6073,11 @@ let activePopupHandle = null;
                 finalEntryName = `本地摘要 (${chatIdentifier} 楼 ${startInternalId+1}-${endInternalId+1})`;
             }
             requireCurrentChat(owner);
+            // 保存总结后独立同步前缀，脉络 API 失败也不应留下重复说明。
+            if (owner.mode === STORAGE_MODE_LOREBOOK && shouldUploadToLorebook && currentPrimaryLorebook) {
+                try { await syncThreadInjection(owner); }
+                catch (error) { showToastr('warning', '总结已保存，记忆头部同步失败：' + error.message); }
+            }
             // 总结已保存后才编织；脉络失败不能把总结流程判为失败。
             try {
                 await weaveThreadForSummary(layerId, summaryText, threadRequestOptions, owner);
