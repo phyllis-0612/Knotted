@@ -101,7 +101,7 @@ let activePopupHandle = null;
 （严格控制在 1-2 句话内。无需重复举例事实，直接提炼本阶段双人关系的实质位移与核心心理结论）
 *   **心理与关系位移**：（精准概括结论，禁止使用"感情升温"等抽象烂梗。例如：A的防备被彻底打破，B的试探得到默许，两人关系从单向入侵转为无声的底线让步。）`;
 
-    // --- 剧情总结写入世界书时的头部说明（可在插件内编辑） ---
+    // --- 整份记忆的头部说明（世界书与注入模式共用，正文只保留剧情） ---
     const DEFAULT_LOREBOOK_HEADER_TEXT = `以下是本故事的历史总结
 [System Note: 以下总结仅作为剧情事实与时间线参考，不构成文风样本。仅参考事件，不套用文风。]`;
 
@@ -253,6 +253,7 @@ let activePopupHandle = null;
     let currentCompressFloorChars = DEFAULT_COMPRESS_FLOOR_CHARS;
     let currentShowGenTag = true;
     let isCompressing = false;   // 互斥锁
+    let isLorebookCompressionWrite = false;
     let autoCompressEnabled = true;
     let bulkConfirmEnabled = true;
     let streamSummaryEnabled = true;
@@ -1775,7 +1776,8 @@ let activePopupHandle = null;
             const owner = captureChat();
             const entries = await TavernHelper_API.getLorebookEntries(currentPrimaryLorebook);
             requireCurrentChat(owner);
-            if (reconcileLorebookThread(entries)) await syncThreadInjection(owner);
+            // 即使脉络未变，也要清理旧总结中重复的头部说明。
+            await syncThreadInjection(owner, entries);
             let maxFloor = -1;
             // Determine the prefix based on the currently selected summary type
             const currentPrefix = selectedSummaryType === 'small' ? SUMMARY_LOREBOOK_SMALL_PREFIX : SUMMARY_LOREBOOK_LARGE_PREFIX;
@@ -1867,10 +1869,11 @@ let activePopupHandle = null;
         logDebug(`[Summarizer Auto-Trigger] Condition check (unsummarizedCount >= N + X): ${unsummarizedCount} >= ${triggerThreshold} -> ${shouldTrigger}`);
 
         if (shouldTrigger) {
+            const owner = captureChat();
             showToastr("info", `检测到 ${unsummarizedCount} 条未总结消息，将自动开始总结 (触发阈值: ${triggerThreshold} 层)。`);
             logWarn(`[Summarizer Auto-Trigger] AUTOMATICALLY triggering summarization. Unsummarized: ${unsummarizedCount}, Threshold: ${triggerThreshold}`);
             await handleAutoSummarize();
-            await checkAndRunAutoCompress();
+            if (isCurrentChat(owner)) await checkAndRunAutoCompress();
         } else {
             logDebug("[Summarizer Auto-Trigger] Not enough unsummarized messages to trigger automatically.");
         }
@@ -2918,7 +2921,7 @@ let activePopupHandle = null;
                         </div>
                         <div id="${SCRIPT_ID_PREFIX}-memory-area-div" class="card-content">
                             <div class="card-content-inner">
-                                <div class="notice-box">
+                                <div class="notice-box inject-memory-controls">
                                     记忆保存在当前聊天里，删除聊天即删除记忆。
                                     可用下方「导出到世界书」做备份。
                                 </div>
@@ -2927,14 +2930,15 @@ let activePopupHandle = null;
                                     <label for="${SCRIPT_ID_PREFIX}-memory-content-textarea">记忆内容</label>
                                     <textarea id="${SCRIPT_ID_PREFIX}-memory-content-textarea" rows="10"></textarea>
                                 </div>
-                                <div class="button-group">
+                                <div class="button-group inject-memory-controls">
                                     <button id="${SCRIPT_ID_PREFIX}-memory-reload-button" class="button button-secondary">重新载入</button>
                                     <button id="${SCRIPT_ID_PREFIX}-memory-save-button" class="button button-primary">保存修改</button>
                                 </div>
-                                <div class="button-group">
+                                <div class="button-group inject-memory-controls">
                                     <button id="${SCRIPT_ID_PREFIX}-memory-export-button" class="button button-secondary">导出到世界书</button>
                                     <button id="${SCRIPT_ID_PREFIX}-memory-clear-button" class="button button-subtle">清空全部记忆</button>
                                 </div>
+                                <p class="hint lorebook-compress-hint" hidden>世界书记忆在此只读显示，可在世界书内容卡片编辑。压缩仅处理当前聊天、当前总结类型的已启用总结；压缩前备份到当前聊天，可撤销。</p>
 
                                 <div class="thread-editor">
                                     <label for="${SCRIPT_ID_PREFIX}-thread-content">事件脉络</label>
@@ -3027,7 +3031,7 @@ let activePopupHandle = null;
                                 </div>
                             </div>
                             <div class="checkbox-group setting-row">
-                                <div class="setting-key">显示代数标记<em>保留压缩代数设置，供后续显示逻辑使用</em></div>
+                                <div class="setting-key">注入时显示代数标记<em>世界书压缩段始终保留代数，支持继续压缩</em></div>
                                 <label class="switch-control">
                                     <input class="compress-show-gen" type="checkbox">
                                     <span></span>
@@ -3126,8 +3130,8 @@ let activePopupHandle = null;
                                     </div>
                                 </div>
                                 <div>
-                                    <label for="${SCRIPT_ID_PREFIX}-lorebook-header-textarea">世界书头部说明</label>
-                                    <textarea id="${SCRIPT_ID_PREFIX}-lorebook-header-textarea" rows="3" placeholder="写入世界书条目前的说明文字。"></textarea>
+                                    <label for="${SCRIPT_ID_PREFIX}-lorebook-header-textarea">记忆头部说明（整份记忆仅一次）</label>
+                                    <textarea id="${SCRIPT_ID_PREFIX}-lorebook-header-textarea" rows="3" placeholder="世界书与注入模式共用，只放在全部总结正文之前。"></textarea>
                                     <div class="button-group" style="margin-top:0.75rem;">
                                         <button id="${SCRIPT_ID_PREFIX}-reset-lorebook-header" class="button button-secondary">恢复默认说明</button>
                                         <button id="${SCRIPT_ID_PREFIX}-save-lorebook-header" class="button button-primary">保存</button>
@@ -3467,10 +3471,14 @@ let activePopupHandle = null;
             var $compressFloorInput = $popupInstance.find('.compress-floor-input');
             var $compressShowGenInput = $popupInstance.find('.compress-show-gen');
 
-            function refreshCompressionPreview() {
+            async function refreshCompressionPreview() {
                 var $line = $popupInstance.find('.compress-plan-line');
                 if (!$line.length) return;
-                var plan = planCompression();
+                var owner = captureChat();
+                var plan;
+                try { plan = await prepareCompressionPlan(); }
+                catch (error) { if (isCurrentChat(owner)) $line.text(error.message); return; }
+                if (!isCurrentChat(owner)) return;
                 if (plan.ok) {
                     $line.text('将压缩 ' + plan.toCompress.length + ' 段 · 跳过 ' + plan.skipped.length + ' 段 · 保鲜 ' + plan.fresh.length + ' 段');
                 } else {
@@ -3597,6 +3605,7 @@ let activePopupHandle = null;
                 // 折叠展开：复用现有卡片的交互模式
                 jQuery_API(P + 'memory-toggle').on('click', function () {
                     reloadMemoryEditor();
+                    refreshCompressionPreview();
                     renderCompressProfileSelect();
                     renderThreadProfileSelect();
                 });
@@ -3680,6 +3689,7 @@ let activePopupHandle = null;
 
                 // 记忆：保存修改
                 jQuery_API(P + 'memory-save-button').on('click', function () {
+                    if (currentStorageMode !== STORAGE_MODE_INJECT) return;
                     if (isSummaryInFlight || isRebuildingThread || isCompressing) {
                         showToastr('info', '请等待当前总结、重建或压缩完成后再修改记忆。'); return;
                     }
@@ -3729,11 +3739,13 @@ let activePopupHandle = null;
 
                 // 记忆：导出世界书
                 jQuery_API(P + 'memory-export-button').on('click', async function () {
+                    if (currentStorageMode !== STORAGE_MODE_INJECT) return;
                     await exportMemoryToLorebook();
                 });
 
                 // 记忆：清空
                 jQuery_API(P + 'memory-clear-button').on('click', function () {
+                    if (currentStorageMode !== STORAGE_MODE_INJECT) return;
                     if (isSummaryInFlight || isRebuildingThread || isCompressing) {
                         showToastr('info', '请等待当前总结、重建或压缩完成后再清空记忆。'); return;
                     }
@@ -3759,7 +3771,9 @@ let activePopupHandle = null;
                 // 立即压缩：先预演，确认后执行
                 jQuery_API(P + 'compress-run-button').on('click', async function () {
                     var $btn = jQuery_API(this);
-                    var plan = planCompression();
+                    var plan;
+                    try { plan = await prepareCompressionPlan(); }
+                    catch (error) { showToastr('error', error.message); return; }
                     if (!plan.ok) {
                         showToastr('info', plan.reason);
                         return;
@@ -3775,7 +3789,9 @@ let activePopupHandle = null;
                     $btn.prop('disabled', true).text('压缩中…');
                     try {
                         var r = await runCompression();
-                        reloadMemoryEditor();
+                        await reloadMemoryEditor();
+                        await displayWorldbookEntriesByWeight(0.0, 1.0);
+                        await refreshCompressionPreview();
                         if (!r.ok) showToastr('error', r.message);
                     } finally {
                         $btn.prop('disabled', false).text('立即压缩');
@@ -3783,18 +3799,20 @@ let activePopupHandle = null;
                 });
 
                 // 撤销压缩
-                jQuery_API(P + 'compress-undo-button').on('click', function () {
+                jQuery_API(P + 'compress-undo-button').on('click', async function () {
                     if (!hasCompressBackup()) {
                         showToastr('info', '没有可用的备份。');
                         return;
                     }
                     if (!confirm('撤销上次压缩，恢复到压缩前的状态？')) return;
-                    var n = restoreMemoryFromBackup();
+                    var n = await restoreCompressionBackup();
                     if (n < 0) {
                         showToastr('error', '恢复失败。');
                         return;
                     }
-                    reloadMemoryEditor();
+                    await reloadMemoryEditor();
+                    await displayWorldbookEntriesByWeight(0.0, 1.0);
+                    await refreshCompressionPreview();
                     if (typeof updateMemoryPanel === 'function') updateMemoryPanel();
                     showToastr('success', '已恢复，共 ' + n + ' 段。');
                 });
@@ -4096,7 +4114,7 @@ let activePopupHandle = null;
     }
 
     /** 刷新记忆状态卡片。任何一步失败都静默跳过，绝不影响其他 UI。 */
-    function updateMemoryPanel() {
+    async function updateMemoryPanel() {
         try {
             if (!jQuery_API) return;
             reloadThreadEditor();
@@ -4105,6 +4123,13 @@ let activePopupHandle = null;
             var $bar = $popupInstance ? $popupInstance.find('.strata-bar') : jQuery_API();
 
             var isInject = (currentStorageMode === STORAGE_MODE_INJECT);
+            var owner = captureChat(), popup = $popupInstance;
+            if ($popupInstance) {
+                $popupInstance.find('.inject-memory-controls').toggle(isInject);
+                $popupInstance.find('.lorebook-compress-hint').prop('hidden', isInject);
+                $popupInstance.find('#' + SCRIPT_ID_PREFIX + '-memory-content-textarea').prop('readOnly', !isInject);
+                $popupInstance.find('#' + SCRIPT_ID_PREFIX + '-worldbook-card').toggle(!isInject);
+            }
             $mode.text(isInject ? '注入式' : '世界书')
                  .removeClass('mode-inject mode-lorebook')
                  .addClass(isInject ? 'mode-inject' : 'mode-lorebook');
@@ -4112,10 +4137,11 @@ let activePopupHandle = null;
             jQuery_API('#' + SCRIPT_ID_PREFIX + '-mem-visible').text(lastVisibleFloorCount);
             jQuery_API('#' + SCRIPT_ID_PREFIX + '-mem-keep').text(currentKeepVisibleCount);
 
-            if (isInject) {
-                var mem = readChatMemory();
-                var maxFloor = getMaxSummarizedFloorFromMemory();
-                var totalChars = getMemoryCharCount();
+            {
+                var mem = isInject ? readChatMemory() : { segments: (await readCompressionSource()).segments };
+                if (!isCurrentChat(owner) || popup !== $popupInstance) return;
+                var maxFloor = mem.segments.reduce((n, s) => Math.max(n, s.endFloor), -1);
+                var totalChars = mem.segments.reduce((n, s) => n + s.text.length, 0);
                 jQuery_API('#' + SCRIPT_ID_PREFIX + '-mem-segs').text(mem.segments.length);
                 jQuery_API('#' + SCRIPT_ID_PREFIX + '-mem-chars').text(totalChars.toLocaleString());
                 if (maxFloor < 0 || mem.segments.length === 0) {
@@ -4146,11 +4172,6 @@ let activePopupHandle = null;
                         }
                     }
                 }
-            } else {
-                jQuery_API('#' + SCRIPT_ID_PREFIX + '-mem-segs').text('—');
-                jQuery_API('#' + SCRIPT_ID_PREFIX + '-mem-chars').text('—');
-                jQuery_API('#' + SCRIPT_ID_PREFIX + '-mem-floor').text('—');
-                if ($bar.length) $bar.html('<div class="strata-empty">世界书模式不显示分段</div>');
             }
 
             // 世界书卡片只在世界书模式下显示。
@@ -4399,6 +4420,7 @@ let activePopupHandle = null;
         updateBulkProgress('running', 0, 1, '正在准备批量总结', '正在重新读取当前聊天与总结进度…');
         let bulkTotalRounds = 1;
         let bulkCompletedRounds = 0;
+        let bulkCompressOwner = null;
 
         try {
             // 插件可能早于 TavernHelper 完成加载；执行时重新探测，避免只在部分设备上静默失效。
@@ -4473,6 +4495,7 @@ let activePopupHandle = null;
             logDebug(`自动总结：已总结到 ${maxSummarizedFloor + 1} 楼。剩余未总结 ${unsummarizedCount} 楼。下次区块大小 ${effectiveChunkSize}。触发阈值 ${triggerThreshold}`);
             let completedRounds = 0;
             const bulkOwner = captureChat();
+            bulkCompressOwner = bulkOwner;
 
             while (unsummarizedCount >= triggerThreshold) {
                 requireCurrentChat(bulkOwner);
@@ -4533,6 +4556,7 @@ let activePopupHandle = null;
         } finally {
             isAutoSummarizing = false;
             if($autoSummarizeButton) $autoSummarizeButton.prop('disabled', false).text("立即执行");
+            if (bulkCompressOwner && isCurrentChat(bulkCompressOwner)) await checkAndRunAutoCompress();
         }
     }
     async function summarizeAndUploadChunk(startInternalId, endInternalId, onStreamUpdate) { /* ... (no change) ... */
@@ -4595,7 +4619,9 @@ let activePopupHandle = null;
 
         logDebug(`管理世界书 "${currentPrimaryLorebook}" 中的总结条目，针对聊天: ${currentChatFileIdentifier}, 选择类型: ${selectedSummaryType}`);
         try {
+            const owner = captureChat();
             const entries = await TavernHelper_API.getLorebookEntries(currentPrimaryLorebook);
+            requireCurrentChat(owner);
             const entriesToUpdate = [];
 
             const smallPrefixPattern = new RegExp(`^${escapeRegex(SUMMARY_LOREBOOK_SMALL_PREFIX)}${escapeRegex(currentChatFileIdentifier)}-\\d+-\\d+$`);
@@ -4646,6 +4672,7 @@ let activePopupHandle = null;
             } else {
                 logDebug("无需更新世界书总结条目的激活状态。");
             }
+            await syncThreadInjection(owner);
         } catch (error) {
             logError("管理世界书总结条目时出错: ", error);
             showToastr("error", "管理世界书总结条目失败。");
@@ -4712,6 +4739,20 @@ let activePopupHandle = null;
         return end < 0 ? '' : content.slice(end + 2);
     }
 
+    // 只移除完整、独占行的已知说明块，避免误删正文中的行内引用。
+    // 对旧数据在段首、段尾和分隔符附近的重复说明同样生效；兼容 CRLF。
+    function stripSummaryHeaders(content, extraHeaders = []) {
+        var headers = [...new Set([...extraHeaders, currentLorebookHeaderText, DEFAULT_LOREBOOK_HEADER_TEXT]
+            .filter(h => typeof h === 'string' && h.trim()).map(h => h.trim()))]
+            .sort((a, b) => b.length - a.length);
+        var body = String(content || '');
+        for (var header of headers) {
+            var pattern = header.split(/\r?\n/).map(escapeRegex).join('\\r?\\n');
+            body = body.replace(new RegExp('^' + pattern + '(?:\\r?\\n|$)', 'gm'), '');
+        }
+        return body.trim();
+    }
+
     function parseThreadOutput(text) {
         return String(text || '').split(/\r?\n/).map(line => line.trim())
             .filter(line => line.startsWith('[') && line.includes(']'));
@@ -4721,43 +4762,54 @@ let activePopupHandle = null;
     function lorebookSummarySegments(entry) {
         var range = (entry.comment || '').match(/-(\d+)-(\d+)$/);
         if (!range) return [];
-        var body = stripThreadPrefix(entry.content || '');
-        for (var header of [currentLorebookHeaderText, DEFAULT_LOREBOOK_HEADER_TEXT]) {
-            if (header && body.startsWith(header + '\n\n')) { body = body.slice(header.length + 2); break; }
-        }
-        var markers = [...body.matchAll(/(?:^|\n)---\r?\n\[(\d+)-(\d+)\]\r?\n/g)];
+        var body = stripSummaryHeaders(stripThreadPrefix(entry.content || ''), [readChatMemory().header]);
+        var markers = [...body.matchAll(/(?:^|\n)---\r?\n\[(?:已压缩·(\d+)代 )?(\d+)-(\d+)\]\r?\n/g)];
         var segments = [];
-        function add(start, end, text) {
-            if (text.trim()) segments.push({ layerId: summaryLayerId(start, end), startFloor: start, endFloor: end, text: text.trim() });
+        var sources = readChatMemory().lorebookSegmentSources[lorebookSourceKey()] || {};
+        function add(start, end, text, gen = 0) {
+            var layerId = summaryLayerId(start, end);
+            if (text.trim()) segments.push({ layerId, sourceLayerIds: gen > 0 ? (sources[layerId] || []) : [],
+                gen, startFloor: start, endFloor: end, text: text.trim() });
         }
-        add(Number(range[1]) - 1, markers.length ? Number(markers[0][1]) - 2 : Number(range[2]) - 1,
+        add(Number(range[1]) - 1, markers.length ? Number(markers[0][2]) - 2 : Number(range[2]) - 1,
             body.slice(0, markers.length ? markers[0].index : body.length));
-        markers.forEach((m, i) => add(Number(m[1]) - 1, Number(m[2]) - 1,
-            body.slice(m.index + m[0].length, i + 1 < markers.length ? markers[i + 1].index : body.length)));
+        markers.forEach((m, i) => add(Number(m[2]) - 1, Number(m[3]) - 1,
+            body.slice(m.index + m[0].length, i + 1 < markers.length ? markers[i + 1].index : body.length), Number(m[1] || 0)));
         return segments;
     }
 
-    async function currentLorebookSummaryEntries() {
+    function lorebookSourceKey() {
+        return JSON.stringify([currentPrimaryLorebook, selectedSummaryType]);
+    }
+
+    function lorebookSegmentBody(segments) {
+        return segments.map(s => '---\n[' + (s.gen > 0 ? '已压缩·' + s.gen + '代 ' : '')
+            + (s.startFloor + 1) + '-' + (s.endFloor + 1) + ']\n' + stripSummaryHeaders(s.text)).join('\n');
+    }
+
+    async function currentLorebookSummaryEntries(existingEntries) {
         if (!currentPrimaryLorebook || !TavernHelper_API?.getLorebookEntries) return [];
         var prefix = (selectedSummaryType === 'small' ? SUMMARY_LOREBOOK_SMALL_PREFIX : SUMMARY_LOREBOOK_LARGE_PREFIX)
             + currentChatFileIdentifier + '-';
-        return (await TavernHelper_API.getLorebookEntries(currentPrimaryLorebook))
+        return (existingEntries || await TavernHelper_API.getLorebookEntries(currentPrimaryLorebook))
             .filter(e => e.enabled && e.comment?.startsWith(prefix) && /-\d+-\d+$/.test(e.comment));
     }
 
-    async function syncThreadInjection(owner = captureChat()) {
+    async function syncThreadInjection(owner = captureChat(), existingEntries) {
         requireCurrentChat(owner);
         if (currentStorageMode === STORAGE_MODE_INJECT) { refreshInjection(); return; }
-        var entries = await currentLorebookSummaryEntries();
+        var entries = await currentLorebookSummaryEntries(existingEntries);
         requireCurrentChat(owner);
-        reconcileLorebookThread(entries);
+        if (!isLorebookCompressionWrite) reconcileLorebookThread(entries);
         if (!entries.length) return;
         entries.sort((a, b) => Number(b.comment.match(/-(\d+)-(\d+)$/)[2]) - Number(a.comment.match(/-(\d+)-(\d+)$/)[2]));
-        // 同样使用一个已有总结块：先移除旧前缀，再把最新脉络放在最完整的条目里。
-        var prefix = threadPrefix(readChatMemory().threadNodes);
-        await TavernHelper_API.setLorebookEntries(currentPrimaryLorebook, entries.map((e, i) => ({
-            ...e, content: (i === 0 ? prefix : '') + stripThreadPrefix(e.content || '')
-        })));
+        // 脉络与说明都是整份记忆的前缀，不能混进单段总结或重复在每个条目里。
+        var memory = readChatMemory();
+        var prefix = threadPrefix(memory.threadNodes) + (currentLorebookHeaderText || DEFAULT_LOREBOOK_HEADER_TEXT) + '\n\n';
+        var changes = entries.map((e, i) => ({
+            ...e, content: (i === 0 ? prefix : '') + stripSummaryHeaders(stripThreadPrefix(e.content || ''), [memory.header])
+        })).filter((e, i) => e.content !== entries[i].content);
+        if (changes.length) await TavernHelper_API.setLorebookEntries(currentPrimaryLorebook, changes);
         requireCurrentChat(owner);
     }
 
@@ -4765,7 +4817,7 @@ let activePopupHandle = null;
         var prefix = (selectedSummaryType === 'small' ? SUMMARY_LOREBOOK_SMALL_PREFIX : SUMMARY_LOREBOOK_LARGE_PREFIX)
             + currentChatFileIdentifier + '-';
         var ids = [...new Set(entries.filter(e => e.enabled && e.comment?.startsWith(prefix))
-            .flatMap(lorebookSummarySegments).map(s => s.layerId))];
+            .flatMap(lorebookSummarySegments).flatMap(segmentLayerIds))];
         var memory = readChatMemory();
         var oldIds = memory.lorebookLayerIds[selectedSummaryType] || [];
         if (JSON.stringify(ids) === JSON.stringify(oldIds)) return false;
@@ -4861,7 +4913,9 @@ let activePopupHandle = null;
         isRebuildingThread = true;
         var completed = 0;
         try {
-            var segments = currentStorageMode === STORAGE_MODE_INJECT ? readChatMemory().segments
+            var segments = currentStorageMode === STORAGE_MODE_INJECT ? readChatMemory().segments.map(s => ({
+                ...s, text: stripSummaryHeaders(s.text, [readChatMemory().header])
+            }))
                 : (await currentLorebookSummaryEntries()).flatMap(lorebookSummarySegments);
             requireCurrentChat(owner);
             segments.sort((a, b) => a.startFloor - b.startFloor);
@@ -4904,6 +4958,7 @@ let activePopupHandle = null;
             segments: [],
             threadNodes: [],
             lorebookLayerIds: {},
+            lorebookSegmentSources: {},
             header: '',
             updatedAt: 0
         };
@@ -4982,6 +5037,13 @@ let activePopupHandle = null;
         out.version = (typeof raw.version === 'number') ? raw.version : 1;
         out.header = (typeof raw.header === 'string') ? raw.header : '';
         out.updatedAt = (typeof raw.updatedAt === 'number') ? raw.updatedAt : 0;
+        if (raw.lorebookSegmentSources && typeof raw.lorebookSegmentSources === 'object') {
+            for (var [scope, records] of Object.entries(raw.lorebookSegmentSources)) {
+                if (!records || typeof records !== 'object' || Array.isArray(records)) continue;
+                out.lorebookSegmentSources[scope] = Object.fromEntries(Object.entries(records)
+                    .filter(([, ids]) => Array.isArray(ids)).map(([id, ids]) => [id, ids.filter(v => typeof v === 'string')]));
+            }
+        }
         for (var type of ['small', 'large']) {
             if (Array.isArray(raw.lorebookLayerIds?.[type])) out.lorebookLayerIds[type] = raw.lorebookLayerIds[type].slice();
         }
@@ -5024,6 +5086,10 @@ let activePopupHandle = null;
         if (!meta || typeof meta !== 'object') return false;
 
         if (!memory || typeof memory !== 'object') memory = makeEmptyMemory();
+        // 手动保存、压缩、撤销和后续写入也统一保存不带说明的总结正文。
+        memory.segments = (memory.segments || []).map(s => ({
+            ...s, text: stripSummaryHeaders(s.text, [memory.header])
+        }));
         memory.version = 1;
         memory.updatedAt = Date.now();
         var previous = meta[CHAT_META_KEY];
@@ -5125,7 +5191,7 @@ let activePopupHandle = null;
                 tag = '[' + (s.startFloor + 1) + '-' + (s.endFloor + 1) + ']';
             }
             parts.push(tag);
-            parts.push(s.text);
+            parts.push(stripSummaryHeaders(s.text, [head]));
             parts.push('');
         }
         return threadPrefix(mem.threadNodes) + parts.join('\n');
@@ -5213,6 +5279,7 @@ let activePopupHandle = null;
             refreshInjection();
         }
 
+        reloadMemoryEditor();
         logWarn('[存储层] 模式已切换: ' + oldMode + ' → ' + targetMode);
         if (typeof updateMemoryPanel === 'function') updateMemoryPanel();
 
@@ -5308,10 +5375,10 @@ let activePopupHandle = null;
             refresh: refreshInjection,
             clear: clearInjection,
             chars: getMemoryCharCount,
-            plan: planCompression,
+            plan: prepareCompressionPlan,
             compress: runCompression,
             backup: backupMemoryBeforeCompress,
-            restore: restoreMemoryFromBackup,
+            restore: restoreCompressionBackup,
             hasBackup: hasCompressBackup,
             setMode: function (m) { currentStorageMode = m; return currentStorageMode; }
         };
@@ -5342,10 +5409,181 @@ let activePopupHandle = null;
         for (var i = 0; i < segs.length; i++) {
             var s = segs[i];
             parts.push('【楼层 ' + (s.startFloor + 1) + '-' + (s.endFloor + 1) + '】');
-            parts.push(s.text);
+            parts.push(stripSummaryHeaders(s.text, [readChatMemory().header]));
             parts.push('');
         }
         return parts.join('\n');
+    }
+
+    async function readCompressionSource() {
+        var owner = captureChat();
+        if (owner.mode === STORAGE_MODE_INJECT) return { owner, segments: readChatMemory().segments };
+        if (!currentPrimaryLorebook || !TavernHelper_API?.getLorebookEntries || !TavernHelper_API?.setLorebookEntries) {
+            throw new Error('未找到可读写的主世界书，请先设置角色的主世界书。');
+        }
+        var book = currentPrimaryLorebook, type = selectedSummaryType;
+        var entries = await currentLorebookSummaryEntries();
+        requireCurrentChat(owner);
+        if (book !== currentPrimaryLorebook || type !== selectedSummaryType) throw new Error('世界书或总结类型已切换。');
+        var segments = entries.flatMap(lorebookSummarySegments).sort((a, b) => a.startFloor - b.startFloor);
+        var unique = [];
+        for (var segment of segments) {
+            if (segment.startFloor < 0 || segment.endFloor < segment.startFloor) {
+                throw new Error('世界书总结的楼层范围格式错误，请先在世界书中整理后压缩。');
+            }
+            var previous = unique[unique.length - 1];
+            if (previous && previous.startFloor === segment.startFloor && previous.endFloor === segment.endFloor
+                && previous.text === segment.text && previous.gen === segment.gen) continue;
+            if (previous && previous.endFloor >= segment.startFloor) {
+                throw new Error('世界书总结区间重叠或重复内容不一致，请先在世界书中整理后压缩。');
+            }
+            unique.push(segment);
+        }
+        return { owner, book, type, sourceKey: lorebookSourceKey(), entries, segments: unique };
+    }
+
+    async function prepareCompressionPlan() {
+        var source = await readCompressionSource();
+        var plan = planCompression({ segments: source.segments });
+        plan.source = source;
+        return plan;
+    }
+
+    function lorebookBackupKey() { return CHAT_META_KEY + '_' + BACKUP_FIELD + '_lorebook'; }
+
+    function saveLorebookCompressionBackup(backup) {
+        var meta = getLiveChatMetadata(), save = getLiveSaveMetadata();
+        if (!meta || !stCaps.chatMetadata || !stCaps.saveMetadata || typeof save !== 'function') throw new Error('无法保存聊天压缩备份，已停止压缩。');
+        var previous = meta[lorebookBackupKey()];
+        meta[lorebookBackupKey()] = backup;
+        try { save(); }
+        catch (error) { meta[lorebookBackupKey()] = previous; throw error; }
+    }
+
+    function lorebookEntrySignature(entry) {
+        return JSON.stringify([entry.uid, entry.comment, !!entry.enabled, entry.keys || [], entry.type,
+            entry.position, entry.order, stripSummaryHeaders(stripThreadPrefix(entry.content || ''))]);
+    }
+
+    function assertLorebookCompressionContext(source) {
+        requireCurrentChat(source.owner);
+        if (source.book !== currentPrimaryLorebook || source.type !== selectedSummaryType) {
+            throw new Error('世界书或总结类型已切换，本次任务已停止。');
+        }
+    }
+
+    function isLorebookCompressionContext(source) {
+        return isCurrentChat(source.owner) && source.book === currentPrimaryLorebook && source.type === selectedSummaryType;
+    }
+
+    async function verifyLorebookSnapshot(source, expected) {
+        assertLorebookCompressionContext(source);
+        var current = await TavernHelper_API.getLorebookEntries(source.book);
+        assertLorebookCompressionContext(source);
+        if (expected.some(e => {
+            var now = current.find(c => c.uid === e.uid);
+            return !now || lorebookEntrySignature(e) !== lorebookEntrySignature(now);
+        })) throw new Error('世界书总结已被编辑或删除，已停止操作以保留当前内容。');
+        var active = await currentLorebookSummaryEntries(current);
+        var expectedIds = expected.filter(e => e.enabled).map(e => e.uid).sort().join(',');
+        if (active.map(e => e.uid).sort().join(',') !== expectedIds) {
+            throw new Error('世界书新增了总结或激活状态已改变，请重新查看后操作。');
+        }
+        return current;
+    }
+
+    async function writeLorebookCompression(source, rebuilt, backup) {
+        await verifyLorebookSnapshot(source, source.entries);
+        var oldMemory = readChatMemory(), memory = readChatMemory();
+        memory.lorebookSegmentSources[source.sourceKey] = Object.fromEntries(rebuilt.filter(s => s.gen > 0)
+            .map(s => [s.layerId, s.sourceLayerIds || []]));
+        var target = source.entries.slice().sort((a, b) => Number(b.comment.match(/-(\d+)-(\d+)$/)[2])
+            - Number(a.comment.match(/-(\d+)-(\d+)$/)[2]))[0];
+        var prefix = (source.type === 'small' ? SUMMARY_LOREBOOK_SMALL_PREFIX : SUMMARY_LOREBOOK_LARGE_PREFIX)
+            + source.owner.identifier + '-';
+        var content = threadPrefix(memory.threadNodes) + (currentLorebookHeaderText || DEFAULT_LOREBOOK_HEADER_TEXT)
+            + '\n\n' + lorebookSegmentBody(rebuilt);
+        var changes = source.entries.map(e => e.uid === target.uid ? {
+            ...e, comment: prefix + (rebuilt[0].startFloor + 1) + '-' + (rebuilt[rebuilt.length - 1].endFloor + 1), content
+        } : { ...e, comment: '[压缩前备份] ' + e.comment, enabled: false });
+        backup.afterEntries = changes;
+        saveLorebookCompressionBackup(backup);
+        if (!writeChatMemory(memory)) throw new Error('压缩关联写入失败，世界书未改动。');
+        isLorebookCompressionWrite = true;
+        try {
+            assertLorebookCompressionContext(source);
+            await TavernHelper_API.setLorebookEntries(source.book, changes);
+            assertLorebookCompressionContext(source);
+            isLorebookCompressionWrite = false;
+            await syncThreadInjection(source.owner);
+        } catch (error) {
+            // 批量世界书写入可能部分成功；在同一聊天恢复完整原条目。
+            if (isLorebookCompressionContext(source)) {
+                try {
+                    isLorebookCompressionWrite = true;
+                    await TavernHelper_API.setLorebookEntries(source.book, source.entries);
+                    oldMemory.threadNodes = readChatMemory().threadNodes;
+                    if (!writeChatMemory(oldMemory)) throw new Error('无法保存恢复后的关联。');
+                    isLorebookCompressionWrite = false;
+                    await syncThreadInjection(source.owner);
+                } catch (rollbackError) {
+                    source.recoveryNeeded = true;
+                    throw new Error(error.message + '；自动恢复失败，原条目备份仍在聊天元数据中：' + rollbackError.message);
+                }
+            }
+            throw error;
+        } finally {
+            isLorebookCompressionWrite = false;
+        }
+    }
+
+    async function restoreCompressionBackup() {
+        if (currentStorageMode === STORAGE_MODE_INJECT) return restoreMemoryFromBackup();
+        if (isSummaryInFlight || isRebuildingThread || isCompressing || isAutoSummarizing) return -1;
+        var backup = getLiveChatMetadata()?.[lorebookBackupKey()];
+        if (!hasCompressBackup()) return -1;
+        var source = { owner: captureChat(), book: backup.book, type: backup.type };
+        isCompressing = true;
+        try {
+            if (!backup.afterEntries) throw new Error('该次压缩没有成功写入，无需撤销。');
+            await verifyLorebookSnapshot(source, backup.afterEntries);
+            var beforeMemory = readChatMemory(), memory = readChatMemory();
+            memory.lorebookSegmentSources[backup.sourceKey] = backup.segmentSources;
+            // 保留现在的脉络（包括用户手改），只恢复总结和来源关联。
+            var oldSources = beforeMemory.lorebookSegmentSources[backup.sourceKey];
+            if (!writeChatMemory(memory)) throw new Error('无法恢复压缩关联。');
+            isLorebookCompressionWrite = true;
+            try {
+                await TavernHelper_API.setLorebookEntries(source.book, backup.entries);
+                assertLorebookCompressionContext(source);
+                var restored = backup.entries.flatMap(lorebookSummarySegments);
+                memory = readChatMemory();
+                memory.lorebookLayerIds[backup.type] = [...new Set(restored.flatMap(segmentLayerIds))];
+                if (!writeChatMemory(memory)) throw new Error('无法保存恢复后的关联。');
+                isLorebookCompressionWrite = false;
+                await syncThreadInjection(source.owner);
+                saveLorebookCompressionBackup(undefined);
+                return new Set(restored.map(s => s.layerId)).size;
+            } catch (error) {
+                if (isLorebookCompressionContext(source)) {
+                    isLorebookCompressionWrite = true;
+                    await TavernHelper_API.setLorebookEntries(source.book, backup.afterEntries);
+                    beforeMemory.lorebookSegmentSources[backup.sourceKey] = oldSources || {};
+                    beforeMemory.threadNodes = readChatMemory().threadNodes;
+                    if (!writeChatMemory(beforeMemory)) throw new Error('无法保存恢复后的关联。');
+                    isLorebookCompressionWrite = false;
+                    await syncThreadInjection(source.owner);
+                }
+                throw error;
+            }
+        } catch (error) {
+            showToastr('error', '撤销压缩失败：' + error.message);
+            return -1;
+        } finally {
+            isLorebookCompressionWrite = false;
+            isCompressing = false;
+            if (isCurrentChat(source.owner)) updateMemoryPanel();
+        }
     }
 
     /** 把当前记忆备份进 chat_metadata。同一时刻只保留一份备份，新的覆盖旧的。 */
@@ -5354,8 +5592,10 @@ let activePopupHandle = null;
         var meta = getLiveChatMetadata();
         if (!meta || typeof meta !== 'object') return false;
         var mem = readChatMemory();
+        var key = CHAT_META_KEY + '_' + BACKUP_FIELD;
+        var previous = meta[key];
         try {
-            meta[CHAT_META_KEY + '_' + BACKUP_FIELD] = {
+            meta[key] = {
                 segments: JSON.parse(JSON.stringify(mem.segments)),
                 header: mem.header,
                 savedAt: Date.now()
@@ -5364,12 +5604,14 @@ let activePopupHandle = null;
             if (typeof saveFn === 'function') {
                 saveFn();
             } else {
+                meta[key] = previous;
                 logError('[存储层] 找不到 saveMetadata，数据可能不会持久化。');
                 return false;
             }
             logDebug('[压缩] 已备份，段数:', mem.segments.length);
             return true;
         } catch (e) {
+            meta[key] = previous;
             logError('[压缩] 备份失败:', e);
             return false;
         }
@@ -5399,6 +5641,11 @@ let activePopupHandle = null;
         if (!stCaps.chatMetadata) return false;
         var meta = getLiveChatMetadata();
         if (!meta || typeof meta !== 'object') return false;
+        if (currentStorageMode === STORAGE_MODE_LOREBOOK) {
+            var lorebook = meta[lorebookBackupKey()];
+            return !!(lorebook && lorebook.afterEntries && lorebook.book === currentPrimaryLorebook && lorebook.type === selectedSummaryType
+                && lorebook.identifier === currentChatFileIdentifier && Array.isArray(lorebook.entries));
+        }
         var bak = meta[CHAT_META_KEY + '_' + BACKUP_FIELD];
         return !!(bak && Object.prototype.toString.call(bak.segments) === '[object Array]');
     }
@@ -5407,18 +5654,12 @@ let activePopupHandle = null;
      * 预演一次压缩，不实际执行。用于 UI 显示「将会发生什么」。
      * 返回 { ok, reason, toCompress, skipped, fresh, beforeChars }
      */
-    function planCompression() {
+    function planCompression(mem = readChatMemory()) {
         var result = {
             ok: false, reason: '', toCompress: [], skipped: [], fresh: [], beforeChars: 0
         };
 
-        if (currentStorageMode !== STORAGE_MODE_INJECT) {
-            result.reason = '当前为世界书模式，压缩功能仅支持注入式存储。';
-            return result;
-        }
-
-        var mem = readChatMemory();
-        result.beforeChars = getMemoryCharCount();
+        result.beforeChars = mem.segments.reduce((n, s) => n + s.text.length, 0);
 
         var fresh = currentFreshCount;
         if (isNaN(fresh) || fresh < 1) fresh = DEFAULT_FRESH_COUNT;
@@ -5442,6 +5683,18 @@ let activePopupHandle = null;
             }
         }
 
+        // 保底段或楼层空隙会隔开剧情，不能合并成覆盖它们的重叠范围。
+        var groups = [], group = [];
+        for (var candidate of result.toCompress) {
+            if (group.length && group[group.length - 1].endFloor + 1 !== candidate.startFloor) {
+                groups.push(group); group = [];
+            }
+            group.push(candidate);
+        }
+        if (group.length) groups.push(group);
+        groups.sort((a, b) => b.length - a.length);
+        result.toCompress = groups[0] || [];
+        result.skipped = candidates.filter(s => !result.toCompress.includes(s));
         if (result.toCompress.length < 2) {
             result.reason = '待压缩段不足 2 段（' + result.toCompress.length + ' 段），压缩无意义，已跳过。';
             return result;
@@ -5474,18 +5727,26 @@ let activePopupHandle = null;
             return { ok: false, message: '压缩使用的 API 配置档未设置 URL 或模型。' };
         }
 
-        var plan = planCompression();
-        if (!plan.ok) {
-            return { ok: false, message: plan.reason };
-        }
-
         isCompressing = true;
         var compressOwner = captureChat();
-        var beforeChars = plan.beforeChars;
-
         try {
+            var plan = await prepareCompressionPlan();
+            requireCurrentChat(compressOwner);
+            if (!plan.ok) return { ok: false, message: plan.reason };
+            var source = plan.source;
+            var beforeChars = plan.beforeChars;
             // 1. 备份（在调 API 之前，失败也不影响原数据）
-            backupMemoryBeforeCompress();
+            var backup;
+            if (compressOwner.mode === STORAGE_MODE_LOREBOOK) {
+                var previousLorebookBackup = getLiveChatMetadata()?.[lorebookBackupKey()];
+                backup = { book: source.book, type: source.type, identifier: compressOwner.identifier,
+                    sourceKey: source.sourceKey, entries: JSON.parse(JSON.stringify(source.entries)),
+                    segmentSources: JSON.parse(JSON.stringify(readChatMemory().lorebookSegmentSources[source.sourceKey] || {})),
+                    savedAt: Date.now() };
+                saveLorebookCompressionBackup(backup);
+            } else if (!backupMemoryBeforeCompress()) {
+                throw new Error('压缩前备份失败，已停止压缩。');
+            }
 
             // 2. 调 API
             var inputText = joinSegmentsForCompress(plan.toCompress);
@@ -5496,7 +5757,7 @@ let activePopupHandle = null;
 
             var compressCfg = getCompressApiConfig();
             logDebug('[压缩] 使用配置档:', (getCompressApiProfile() ? getCompressApiProfile().name : '无'), '模型:', compressCfg.model);
-            var compressed = await callCustomOpenAIWith(currentCompressPrompt, userPrompt, compressCfg);
+            var compressed = stripSummaryHeaders(await callCustomOpenAIWith(currentCompressPrompt, userPrompt, compressCfg), [readChatMemory().header]);
             requireCurrentChat(compressOwner);
             if (!compressed || compressed.trim() === '') {
                 throw new Error('AI 未返回有效的压缩内容。');
@@ -5513,7 +5774,7 @@ let activePopupHandle = null;
             }
 
             var newSeg = {
-                layerId: plan.toCompress[0].layerId,
+                layerId: compressOwner.mode === STORAGE_MODE_LOREBOOK ? summaryLayerId(minStart, maxEnd) : plan.toCompress[0].layerId,
                 sourceLayerIds: [...new Set(plan.toCompress.flatMap(segmentLayerIds))],
                 gen: maxGen + 1,
                 startFloor: minStart,
@@ -5531,15 +5792,17 @@ let activePopupHandle = null;
             for (j = 0; j < plan.fresh.length; j++) rebuilt.push(plan.fresh[j]);
             rebuilt.sort(function (a, b) { return a.startFloor - b.startFloor; });
 
-            mem.segments = rebuilt;
-            var writeOk = writeChatMemory(mem);
-            if (!writeOk) {
-                throw new Error('压缩结果写入失败。原数据已备份，可点击"撤销压缩"恢复。');
+            if (compressOwner.mode === STORAGE_MODE_LOREBOOK) {
+                await writeLorebookCompression(source, rebuilt, backup);
+            } else {
+                mem.segments = rebuilt;
+                var writeOk = writeChatMemory(mem);
+                if (!writeOk) {
+                    throw new Error('压缩结果写入失败。原数据已备份，可点击"撤销压缩"恢复。');
+                }
+                refreshInjection();
             }
-
-            refreshInjection();
-
-            var afterChars = getMemoryCharCount();
+            var afterChars = rebuilt.reduce((n, s) => n + s.text.length, 0);
             var saved = beforeChars - afterChars;
             var msg = '压缩完成：' + beforeChars + ' → ' + afterChars + ' 字（省下 ' + saved + ' 字）';
             logDebug('[压缩] ' + msg);
@@ -5551,6 +5814,10 @@ let activePopupHandle = null;
             return { ok: true, message: msg, before: beforeChars, after: afterChars };
 
         } catch (e) {
+            if (compressOwner.mode === STORAGE_MODE_LOREBOOK && backup && isCurrentChat(compressOwner) && !source?.recoveryNeeded) {
+                try { saveLorebookCompressionBackup(previousLorebookBackup); }
+                catch (backupError) { logError('[压缩] 恢复上一份备份失败:', backupError); }
+            }
             logError('[压缩] 执行失败:', e);
             var errMsg = '压缩失败：' + (e && e.message ? e.message : String(e));
             if ($statusMessageSpan) $statusMessageSpan.text(errMsg);
@@ -5565,14 +5832,13 @@ let activePopupHandle = null;
      * 把记忆渲染成可编辑的纯文本。
      * 格式与解析函数严格对应，改一个必须改另一个。
      */
-    function memoryToEditableText() {
-        var mem = readChatMemory();
+    function memoryToEditableText(mem = readChatMemory()) {
         if (mem.segments.length === 0) return '';
         var parts = [];
         for (var i = 0; i < mem.segments.length; i++) {
             var s = mem.segments[i];
             parts.push('### [' + s.gen + '] ' + s.startFloor + '-' + s.endFloor);
-            parts.push(s.text);
+            parts.push(stripSummaryHeaders(s.text, [mem.header]));
             parts.push('');
         }
         return parts.join('\n');
@@ -5686,10 +5952,19 @@ let activePopupHandle = null;
     }
 
     /** 刷新记忆编辑框的内容。 */
-    function reloadMemoryEditor() {
+    async function reloadMemoryEditor() {
         if (!jQuery_API) return;
         var $ta = jQuery_API('#' + SCRIPT_ID_PREFIX + '-memory-content-textarea');
-        if ($ta.length) $ta.val(memoryToEditableText());
+        if (!$ta.length) return;
+        var owner = captureChat();
+        try {
+            var memory = owner.mode === STORAGE_MODE_INJECT ? readChatMemory() : {
+                segments: (await readCompressionSource()).segments, header: readChatMemory().header
+            };
+            if (isCurrentChat(owner)) $ta.prop('readOnly', owner.mode !== STORAGE_MODE_INJECT).val(memoryToEditableText(memory));
+        } catch (error) {
+            if (isCurrentChat(owner)) $ta.prop('readOnly', true).val(error.message);
+        }
     }
 
     function renderThreadProfileSelect() {
@@ -5731,18 +6006,17 @@ let activePopupHandle = null;
      * 总结完成后调用：检查是否需要自动压缩。
      *
      * 设计要点：
-     * · 只在注入式模式下工作
+     * · 两种模式都只统计当前聊天的总结正文
      * · 任何一步不满足条件都静默返回，绝不打断总结流程
      * · 压缩失败不抛出异常，只记录日志——总结已经成功了，不能因为压缩失败让用户以为总结也失败了
      */
     async function checkAndRunAutoCompress() {
         try {
             if (!autoCompressEnabled) return;
-            if (currentStorageMode !== STORAGE_MODE_INJECT) return;
             if (isCompressing) return;
             if (isAutoSummarizing) return;
-
-            var chars = getMemoryCharCount();
+            var plan = await prepareCompressionPlan();
+            var chars = plan.beforeChars;
             var threshold = currentCompressThreshold;
             if (isNaN(threshold) || threshold < 1000) threshold = DEFAULT_COMPRESS_THRESHOLD;
 
@@ -5751,7 +6025,6 @@ let activePopupHandle = null;
                 return;
             }
 
-            var plan = planCompression();
             if (!plan.ok) {
                 logDebug('[自动压缩] 条件不满足：' + plan.reason);
                 return;
@@ -5954,7 +6227,7 @@ let activePopupHandle = null;
                 if (existingSegment) layerId = existingSegment.layerId;
             }
             // Note: callCustomOpenAI now internally combines currentBreakArmorPrompt and currentSummaryPrompt
-            const summaryText = await callCustomOpenAI(null, userPromptForSummarization, onStreamUpdate, requestOptions);
+            const summaryText = stripSummaryHeaders(await callCustomOpenAI(null, userPromptForSummarization, onStreamUpdate, requestOptions), [readChatMemory().header]);
             requireCurrentChat(owner);
             if (!summaryText || summaryText.trim() === "") { throw new Error("自定义AI未能生成有效的摘要。"); }
             logDebug(`自定义AI生成的摘要 (${floorRangeText}):\n${summaryText}`);
@@ -6011,7 +6284,7 @@ let activePopupHandle = null;
                     combinedEndFloorDisplay = Math.max(...oldSegments.map(s => s.endFloor)) + 1;
                     finalContentForLorebook = threadPrefix(readChatMemory().threadNodes)
                         + (currentLorebookHeaderText || DEFAULT_LOREBOOK_HEADER_TEXT) + '\n\n'
-                        + oldSegments.map(s => '---\n[' + (s.startFloor + 1) + '-' + (s.endFloor + 1) + ']\n' + s.text).join('\n');
+                        + lorebookSegmentBody(oldSegments);
                     finalEntryName = `${currentSummaryPrefix}${chatIdentifier}-${combinedStartFloorDisplay}-${combinedEndFloorDisplay}`;
                     await TavernHelper_API.setLorebookEntries(currentPrimaryLorebook, [{
                         uid: finalEntryUid, comment: finalEntryName, content: finalContentForLorebook,
@@ -6050,6 +6323,11 @@ let activePopupHandle = null;
                 finalEntryName = `本地摘要 (${chatIdentifier} 楼 ${startInternalId+1}-${endInternalId+1})`;
             }
             requireCurrentChat(owner);
+            // 保存总结后独立同步前缀，脉络 API 失败也不应留下重复说明。
+            if (owner.mode === STORAGE_MODE_LOREBOOK && shouldUploadToLorebook && currentPrimaryLorebook) {
+                try { await syncThreadInjection(owner); }
+                catch (error) { showToastr('warning', '总结已保存，记忆头部同步失败：' + error.message); }
+            }
             // 总结已保存后才编织；脉络失败不能把总结流程判为失败。
             try {
                 await weaveThreadForSummary(layerId, summaryText, threadRequestOptions, owner);
