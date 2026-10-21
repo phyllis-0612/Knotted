@@ -146,6 +146,7 @@ let activePopupHandle = null;
     const STORAGE_KEY_COMPRESS_PROMPT = `${SCRIPT_ID_PREFIX}_compressPrompt_v1`;
     const STORAGE_KEY_FRESH_COUNT = `${SCRIPT_ID_PREFIX}_freshCount_v1`;
     const STORAGE_KEY_COMPRESS_THRESHOLD = `${SCRIPT_ID_PREFIX}_compressThreshold_v1`;
+    const STORAGE_KEY_COMPRESS_TARGET = `${SCRIPT_ID_PREFIX}_compressTargetChars_v1`;
     const STORAGE_KEY_COMPRESS_FLOOR = `${SCRIPT_ID_PREFIX}_compressFloorChars_v1`;
     const STORAGE_KEY_SHOW_GEN_TAG = `${SCRIPT_ID_PREFIX}_showGenTag_v1`;
     const STORAGE_KEY_AUTO_COMPRESS = `${SCRIPT_ID_PREFIX}_autoCompress_v1`;
@@ -156,7 +157,14 @@ let activePopupHandle = null;
 
     const DEFAULT_FRESH_COUNT = 3;
     const DEFAULT_COMPRESS_THRESHOLD = 8000;
+    const DEFAULT_COMPRESS_TARGET_CHARS = 6000;
     const DEFAULT_COMPRESS_FLOOR_CHARS = 2000;
+    const MIN_SINGLE_COMPRESS_CHARS = 200;
+
+    function compressionCount(value, fallback) {
+        var count = Number(value);
+        return Number.isSafeInteger(count) && count >= 0 ? count : fallback;
+    }
 
     // 备份存放在 chat_metadata 里，键名固定
     const BACKUP_FIELD = 'backup';
@@ -250,6 +258,7 @@ let activePopupHandle = null;
     let currentCompressPrompt = DEFAULT_COMPRESS_PROMPT;
     let currentFreshCount = DEFAULT_FRESH_COUNT;
     let currentCompressThreshold = DEFAULT_COMPRESS_THRESHOLD;
+    let currentCompressTargetChars = DEFAULT_COMPRESS_TARGET_CHARS;
     let currentCompressFloorChars = DEFAULT_COMPRESS_FLOOR_CHARS;
     let currentShowGenTag = true;
     let isCompressing = false;   // 互斥锁
@@ -350,6 +359,7 @@ let activePopupHandle = null;
         if (typeof settings.compressPrompt !== 'string') settings.compressPrompt = DEFAULT_COMPRESS_PROMPT;
         if (typeof settings.freshCount !== 'number') settings.freshCount = DEFAULT_FRESH_COUNT;
         if (typeof settings.compressThreshold !== 'number') settings.compressThreshold = DEFAULT_COMPRESS_THRESHOLD;
+        if (typeof settings.compressTargetChars !== 'number') settings.compressTargetChars = DEFAULT_COMPRESS_TARGET_CHARS;
         if (typeof settings.compressFloorChars !== 'number') settings.compressFloorChars = DEFAULT_COMPRESS_FLOOR_CHARS;
         if (typeof settings.showGenTag !== 'boolean') settings.showGenTag = true;
         if (typeof settings.autoCompress !== 'boolean') settings.autoCompress = true;
@@ -481,6 +491,8 @@ let activePopupHandle = null;
                     return String(settings.freshCount);
                 case STORAGE_KEY_COMPRESS_THRESHOLD:
                     return String(settings.compressThreshold);
+                case STORAGE_KEY_COMPRESS_TARGET:
+                    return String(settings.compressTargetChars);
                 case STORAGE_KEY_COMPRESS_FLOOR:
                     return String(settings.compressFloorChars);
                 case STORAGE_KEY_SHOW_GEN_TAG:
@@ -548,13 +560,16 @@ let activePopupHandle = null;
                     settings.compressPrompt = String(value === null || typeof value === 'undefined' ? '' : value);
                     break;
                 case STORAGE_KEY_FRESH_COUNT:
-                    settings.freshCount = parseInt(value, 10) || DEFAULT_FRESH_COUNT;
+                    settings.freshCount = compressionCount(parseInt(value, 10), DEFAULT_FRESH_COUNT);
                     break;
                 case STORAGE_KEY_COMPRESS_THRESHOLD:
                     settings.compressThreshold = parseInt(value, 10) || DEFAULT_COMPRESS_THRESHOLD;
                     break;
+                case STORAGE_KEY_COMPRESS_TARGET:
+                    settings.compressTargetChars = compressionCount(parseInt(value, 10), DEFAULT_COMPRESS_TARGET_CHARS);
+                    break;
                 case STORAGE_KEY_COMPRESS_FLOOR:
-                    settings.compressFloorChars = parseInt(value, 10) || DEFAULT_COMPRESS_FLOOR_CHARS;
+                    settings.compressFloorChars = compressionCount(parseInt(value, 10), DEFAULT_COMPRESS_FLOOR_CHARS);
                     break;
                 case STORAGE_KEY_SHOW_GEN_TAG:
                     settings.showGenTag = String(value) !== 'false';
@@ -628,6 +643,9 @@ let activePopupHandle = null;
                     break;
                 case STORAGE_KEY_COMPRESS_THRESHOLD:
                     settings.compressThreshold = DEFAULT_COMPRESS_THRESHOLD;
+                    break;
+                case STORAGE_KEY_COMPRESS_TARGET:
+                    settings.compressTargetChars = DEFAULT_COMPRESS_TARGET_CHARS;
                     break;
                 case STORAGE_KEY_COMPRESS_FLOOR:
                     settings.compressFloorChars = DEFAULT_COMPRESS_FLOOR_CHARS;
@@ -956,13 +974,16 @@ let activePopupHandle = null;
         currentCompressPrompt = (typeof savedCp === 'string' && savedCp !== '') ? savedCp : DEFAULT_COMPRESS_PROMPT;
 
         var savedFc = parseInt(localStorage.getItem(STORAGE_KEY_FRESH_COUNT), 10);
-        currentFreshCount = (!isNaN(savedFc) && savedFc >= 1) ? savedFc : DEFAULT_FRESH_COUNT;
+        currentFreshCount = compressionCount(savedFc, DEFAULT_FRESH_COUNT);
 
         var savedCt = parseInt(localStorage.getItem(STORAGE_KEY_COMPRESS_THRESHOLD), 10);
         currentCompressThreshold = (!isNaN(savedCt) && savedCt >= 1000) ? savedCt : DEFAULT_COMPRESS_THRESHOLD;
 
+        var savedTarget = parseInt(localStorage.getItem(STORAGE_KEY_COMPRESS_TARGET), 10);
+        currentCompressTargetChars = compressionCount(savedTarget, DEFAULT_COMPRESS_TARGET_CHARS);
+
         var savedCf = parseInt(localStorage.getItem(STORAGE_KEY_COMPRESS_FLOOR), 10);
-        currentCompressFloorChars = (!isNaN(savedCf) && savedCf >= 200) ? savedCf : DEFAULT_COMPRESS_FLOOR_CHARS;
+        currentCompressFloorChars = compressionCount(savedCf, DEFAULT_COMPRESS_FLOOR_CHARS);
 
         var savedGt = localStorage.getItem(STORAGE_KEY_SHOW_GEN_TAG);
         currentShowGenTag = (savedGt === 'false') ? false : true;
@@ -2788,6 +2809,7 @@ let activePopupHandle = null;
                         <div>
                             <div class="mem-label strata-label">记忆地层</div>
                             <div class="strata-count"><span id="${SCRIPT_ID_PREFIX}-mem-chars">—</span><small>字</small></div>
+                            <p class="hint" id="${SCRIPT_ID_PREFIX}-mem-breakdown">总结正文 + 事件脉络</p>
                         </div>
                         <b id="${SCRIPT_ID_PREFIX}-mem-mode" class="strata-mode">—</b>
                     </div>
@@ -3002,20 +3024,20 @@ let activePopupHandle = null;
                         <div class="static-card-header">
                             <div>
                                 <h2 class="header-title">压缩参数</h2>
-                                <p class="hint">保鲜区不参与压缩；保底段会被原样跳过。</p>
+                                <p class="hint">保鲜和保底都可设为 0 关闭。字数按总结正文与事件脉络的文本长度统计，不等于 token 数。</p>
                             </div>
                         </div>
                         <div class="card-content-inner compression-settings">
                             <div class="setting-row">
-                                <div class="setting-key">保鲜段数<em>末尾几段总结永不参与压缩</em></div>
+                                <div class="setting-key">保鲜段数<em>末尾几段总结不压缩；0 为不保鲜</em></div>
                                 <div class="stepper">
                                     <button type="button" class="step-button" data-target-class="compress-fresh-input" data-delta="-1">−</button>
-                                    <input class="compress-fresh-input" type="number" min="1" step="1">
+                                    <input class="compress-fresh-input" type="number" min="0" step="1">
                                     <button type="button" class="step-button" data-target-class="compress-fresh-input" data-delta="1">＋</button>
                                 </div>
                             </div>
                             <div class="setting-row">
-                                <div class="setting-key">触发字数<em>记忆超过此长度时进入可压缩状态</em></div>
+                                <div class="setting-key">触发字数<em>总结正文与脉络达到此长度时检查自动压缩</em></div>
                                 <div class="stepper">
                                     <button type="button" class="step-button" data-target-class="compress-threshold-input" data-delta="-500">−</button>
                                     <input class="compress-threshold-input" type="number" min="1000" step="500">
@@ -3023,10 +3045,18 @@ let activePopupHandle = null;
                                 </div>
                             </div>
                             <div class="setting-row">
-                                <div class="setting-key">保底字数<em>已压缩段低于此长度不再二次压缩</em></div>
+                                <div class="setting-key">压缩后目标总字数<em>包含总结正文和事件脉络；0 为不限制目标</em></div>
+                                <div class="stepper">
+                                    <button type="button" class="step-button" data-target-class="compress-target-input" data-delta="-500">−</button>
+                                    <input class="compress-target-input" type="number" min="0" step="500">
+                                    <button type="button" class="step-button" data-target-class="compress-target-input" data-delta="500">＋</button>
+                                </div>
+                            </div>
+                            <div class="setting-row">
+                                <div class="setting-key">保底字数<em>已压缩段低于此长度不再压缩；0 为关闭保护</em></div>
                                 <div class="stepper">
                                     <button type="button" class="step-button" data-target-class="compress-floor-input" data-delta="-200">−</button>
-                                    <input class="compress-floor-input" type="number" min="200" step="200">
+                                    <input class="compress-floor-input" type="number" min="0" step="200">
                                     <button type="button" class="step-button" data-target-class="compress-floor-input" data-delta="200">＋</button>
                                 </div>
                             </div>
@@ -3052,7 +3082,7 @@ let activePopupHandle = null;
                             <div class="summary-status-line compress-plan-line">正在计算压缩计划…</div>
                             <div class="button-group">
                             </div>
-                            <div class="notice-box"><b>保鲜区不会改变。</b> 压缩只合并前部总结段，楼层范围会被完整保留。</div>
+                            <div class="notice-box">保鲜段与保底段原样保留；连续旧总结可合并，单段达到 200 字也可再压缩。目标需扣除本次保留的总结和全部脉络；模型输出未缩短或超目标时保留原记忆，不截断。</div>
                         </div>
                     </div>
                     </section>
@@ -3367,9 +3397,10 @@ let activePopupHandle = null;
                         <h4>压缩</h4>
                         <p>记忆攒多了，把靠前的几段合并成一段更短的。可以反复压，老剧情会收敛成骨架。</p>
                         <ul>
-                            <li><b>保鲜段数</b>：末尾这么多段不压，保留细节。默认 3。</li>
-                            <li><b>触发字数</b>：记忆超过这个长度才压。默认 8000。</li>
-                            <li><b>保底字数</b>：压缩块短于此值就不再压，防止老剧情被榨干。默认 2000。</li>
+                            <li><b>保鲜段数</b>：末尾这么多段不压，保留细节。默认 3；设为 0 可关闭。</li>
+                            <li><b>触发字数</b>：总结正文加事件脉络达到此长度时检查自动压缩。默认 8000。</li>
+                            <li><b>目标总字数</b>：压缩后总结正文加事件脉络的目标，默认 6000；0 为不设目标。不包含头部说明、楼层标记等格式文字，也不是 token 数。</li>
+                            <li><b>保底字数</b>：压缩块短于此值就不再压，默认 2000；设为 0 可关闭保护。单独一段达到 200 字也可继续压缩。</li>
                         </ul>
                         <p>压缩前会自动备份，点「撤销上次压缩」可以还原。压缩提示词能自己改，决定了老剧情保留什么。</p>
 
@@ -3468,6 +3499,7 @@ let activePopupHandle = null;
             var $compressPromptInput = $popupInstance.find('.compress-prompt-input');
             var $compressFreshInput = $popupInstance.find('.compress-fresh-input');
             var $compressThresholdInput = $popupInstance.find('.compress-threshold-input');
+            var $compressTargetInput = $popupInstance.find('.compress-target-input');
             var $compressFloorInput = $popupInstance.find('.compress-floor-input');
             var $compressShowGenInput = $popupInstance.find('.compress-show-gen');
 
@@ -3480,7 +3512,9 @@ let activePopupHandle = null;
                 catch (error) { if (isCurrentChat(owner)) $line.text(error.message); return; }
                 if (!isCurrentChat(owner)) return;
                 if (plan.ok) {
-                    $line.text('将压缩 ' + plan.toCompress.length + ' 段 · 跳过 ' + plan.skipped.length + ' 段 · 保鲜 ' + plan.fresh.length + ' 段');
+                    $line.text('将压缩 ' + plan.toCompress.length + ' 段 · 本次保留 ' + plan.skipped.length + ' 段 · 保鲜 ' + plan.fresh.length
+                        + ' 段 · 总结 ' + plan.beforeChars + ' 字 + 脉络 ' + plan.threadChars + ' 字'
+                        + (plan.targetChars ? ' · 目标 ' + plan.targetChars + ' 字，本次输出最多 ' + plan.outputLimit + ' 字' : ' · 不设目标总字数'));
                 } else {
                     $line.text(plan.reason);
                 }
@@ -3508,6 +3542,7 @@ let activePopupHandle = null;
             $compressPromptInput.val(currentCompressPrompt);
             $compressFreshInput.val(currentFreshCount);
             $compressThresholdInput.val(currentCompressThreshold);
+            $compressTargetInput.val(currentCompressTargetChars);
             $compressFloorInput.val(currentCompressFloorChars);
             $compressShowGenInput.prop('checked', currentShowGenTag);
             updateSummaryTypeSelectionUI(); // 根据加载的类型显示/隐藏对应的输入框
@@ -3780,9 +3815,10 @@ let activePopupHandle = null;
                     }
                     var msg = '将要压缩：\n\n'
                         + '· 待压缩 ' + plan.toCompress.length + ' 段\n'
-                        + '· 保底跳过 ' + plan.skipped.length + ' 段\n'
+                        + '· 本次保留 ' + plan.skipped.length + ' 段（保底或非连续区间）\n'
                         + '· 保鲜保留 ' + plan.fresh.length + ' 段\n'
-                        + '· 当前共 ' + plan.beforeChars + ' 字\n\n'
+                        + '· 总结 ' + plan.beforeChars + ' 字 + 脉络 ' + plan.threadChars + ' 字\n'
+                        + (plan.targetChars ? '· 压缩后目标总字数 ' + plan.targetChars + ' 字，本次输出最多 ' + plan.outputLimit + ' 字\n\n' : '· 不设目标总字数，但结果必须缩短\n\n')
                         + '压缩前会自动备份，可撤销。是否继续？';
                     if (!confirm(msg)) return;
 
@@ -3952,25 +3988,32 @@ let activePopupHandle = null;
             $popupInstance.find('.compression-settings-save').on('click', function() {
                 var fresh = parseInt($compressFreshInput.val(), 10);
                 var threshold = parseInt($compressThresholdInput.val(), 10);
+                var target = Number($compressTargetInput.val());
                 var floorChars = parseInt($compressFloorInput.val(), 10);
-                if (isNaN(fresh) || fresh < 1) {
-                    showToastr('warning', '保鲜段数不能小于 1。');
+                if (!Number.isSafeInteger(fresh) || fresh < 0) {
+                    showToastr('warning', '保鲜段数需为非负整数，0 为关闭。');
                     return;
                 }
                 if (isNaN(threshold) || threshold < 1000) {
                     showToastr('warning', '触发字数不能小于 1000。');
                     return;
                 }
-                if (isNaN(floorChars) || floorChars < 200) {
-                    showToastr('warning', '保底字数不能小于 200。');
+                if (!Number.isSafeInteger(target) || target < 0) {
+                    showToastr('warning', '目标总字数需为非负整数，0 为不设目标。');
+                    return;
+                }
+                if (!Number.isSafeInteger(floorChars) || floorChars < 0) {
+                    showToastr('warning', '保底字数需为非负整数，0 为关闭保护。');
                     return;
                 }
                 currentFreshCount = fresh;
                 currentCompressThreshold = threshold;
+                currentCompressTargetChars = target;
                 currentCompressFloorChars = floorChars;
                 currentShowGenTag = $compressShowGenInput.prop('checked');
                 localStorage.setItem(STORAGE_KEY_FRESH_COUNT, String(currentFreshCount));
                 localStorage.setItem(STORAGE_KEY_COMPRESS_THRESHOLD, String(currentCompressThreshold));
+                localStorage.setItem(STORAGE_KEY_COMPRESS_TARGET, String(currentCompressTargetChars));
                 localStorage.setItem(STORAGE_KEY_COMPRESS_FLOOR, String(currentCompressFloorChars));
                 localStorage.setItem(STORAGE_KEY_SHOW_GEN_TAG, String(currentShowGenTag));
                 showToastr('success', '压缩参数已保存。');
@@ -4141,9 +4184,11 @@ let activePopupHandle = null;
                 var mem = isInject ? readChatMemory() : { segments: (await readCompressionSource()).segments };
                 if (!isCurrentChat(owner) || popup !== $popupInstance) return;
                 var maxFloor = mem.segments.reduce((n, s) => Math.max(n, s.endFloor), -1);
-                var totalChars = mem.segments.reduce((n, s) => n + s.text.length, 0);
+                var totalChars = summaryBodyChars(mem.segments);
+                var threadChars = threadBodyChars();
                 jQuery_API('#' + SCRIPT_ID_PREFIX + '-mem-segs').text(mem.segments.length);
-                jQuery_API('#' + SCRIPT_ID_PREFIX + '-mem-chars').text(totalChars.toLocaleString());
+                jQuery_API('#' + SCRIPT_ID_PREFIX + '-mem-chars').text((totalChars + threadChars).toLocaleString());
+                jQuery_API('#' + SCRIPT_ID_PREFIX + '-mem-breakdown').text('总结 ' + totalChars.toLocaleString() + ' 字 + 脉络 ' + threadChars.toLocaleString() + ' 字');
                 if (maxFloor < 0 || mem.segments.length === 0) {
                     jQuery_API('#' + SCRIPT_ID_PREFIX + '-mem-floor').text('—');
                 } else {
@@ -5289,9 +5334,7 @@ let activePopupHandle = null;
     /** 当前记忆的总字数。给 UI 显示用。 */
     function getMemoryCharCount() {
         var mem = readChatMemory();
-        var n = 0;
-        for (var i = 0; i < mem.segments.length; i++) n += mem.segments[i].text.length;
-        return n;
+        return summaryBodyChars(mem.segments) + threadBodyChars(mem.threadNodes);
     }
 
     function runStorageSelfTest() {
@@ -5347,9 +5390,9 @@ let activePopupHandle = null;
         lines.push('可否压缩: ' + (pl.ok ? '是' : '否'));
         if (!pl.ok) lines.push('原因: ' + pl.reason);
         lines.push('待压缩: ' + pl.toCompress.length + ' 段');
-        lines.push('保底跳过: ' + pl.skipped.length + ' 段');
+        lines.push('本次保留: ' + pl.skipped.length + ' 段');
         lines.push('保鲜区: ' + pl.fresh.length + ' 段');
-        lines.push('当前字数: ' + pl.beforeChars);
+        lines.push('当前字数（含脉络）: ' + pl.totalChars);
         lines.push('有备份: ' + (hasCompressBackup() ? '是' : '否'));
 
         return lines.join('\n');
@@ -5444,7 +5487,7 @@ let activePopupHandle = null;
 
     async function prepareCompressionPlan() {
         var source = await readCompressionSource();
-        var plan = planCompression({ segments: source.segments });
+        var plan = planCompression({ segments: source.segments, threadNodes: readChatMemory().threadNodes });
         plan.source = source;
         return plan;
     }
@@ -5492,8 +5535,9 @@ let activePopupHandle = null;
         return current;
     }
 
-    async function writeLorebookCompression(source, rebuilt, backup) {
+    async function writeLorebookCompression(source, rebuilt, backup, validateResult) {
         await verifyLorebookSnapshot(source, source.entries);
+        validateResult?.();
         var oldMemory = readChatMemory(), memory = readChatMemory();
         memory.lorebookSegmentSources[source.sourceKey] = Object.fromEntries(rebuilt.filter(s => s.gen > 0)
             .map(s => [s.layerId, s.sourceLayerIds || []]));
@@ -5654,15 +5698,37 @@ let activePopupHandle = null;
      * 预演一次压缩，不实际执行。用于 UI 显示「将会发生什么」。
      * 返回 { ok, reason, toCompress, skipped, fresh, beforeChars }
      */
+    function summaryBodyChars(segments) {
+        var header = readChatMemory().header;
+        return segments.reduce((n, s) => n + stripSummaryHeaders(s.text, [header]).length, 0);
+    }
+
+    function threadBodyChars(nodes = readChatMemory().threadNodes) {
+        return nodes.reduce((n, node) => n + node.text.length, 0);
+    }
+
+    function validateCompressionOutput(plan, compressed) {
+        if (compressed.length >= plan.inputChars) {
+            throw new Error('模型输出未缩短（待压缩正文 ' + plan.inputChars + ' 字，返回 ' + compressed.length
+                + ' 字），未替换原记忆。请调整压缩提示词或模型后重试。');
+        }
+        // 脉络可在请求期间手动编辑，按最新内容重新核算预算，不覆盖人工修改。
+        var afterTotal = summaryBodyChars([...plan.skipped, ...plan.fresh]) + compressed.length + threadBodyChars();
+        if (plan.targetChars > 0 && afterTotal > plan.targetChars) {
+            throw new Error('模型输出超过目标：含事件脉络共 ' + afterTotal + ' 字，目标 ' + plan.targetChars
+                + ' 字。未替换或截断原记忆；请调整目标、保鲜/保底或压缩提示词后重试。');
+        }
+    }
+
     function planCompression(mem = readChatMemory()) {
         var result = {
-            ok: false, reason: '', toCompress: [], skipped: [], fresh: [], beforeChars: 0
+            ok: false, reason: '', toCompress: [], skipped: [], fresh: [], beforeChars: summaryBodyChars(mem.segments),
+            threadChars: threadBodyChars(mem.threadNodes), targetChars: compressionCount(currentCompressTargetChars, DEFAULT_COMPRESS_TARGET_CHARS)
         };
+        result.totalChars = result.beforeChars + result.threadChars;
 
-        result.beforeChars = mem.segments.reduce((n, s) => n + s.text.length, 0);
-
-        var fresh = currentFreshCount;
-        if (isNaN(fresh) || fresh < 1) fresh = DEFAULT_FRESH_COUNT;
+        var fresh = compressionCount(currentFreshCount, DEFAULT_FRESH_COUNT);
+        result.fresh = mem.segments.slice(Math.max(0, mem.segments.length - fresh));
 
         if (mem.segments.length <= fresh) {
             result.reason = '记忆段数（' + mem.segments.length + '）未超过保鲜段数（' + fresh + '），无需压缩。';
@@ -5692,11 +5758,22 @@ let activePopupHandle = null;
             group.push(candidate);
         }
         if (group.length) groups.push(group);
-        groups.sort((a, b) => b.length - a.length);
+        groups = groups.filter(g => g.length >= 2 || summaryBodyChars(g) >= MIN_SINGLE_COMPRESS_CHARS);
+        groups.sort((a, b) => summaryBodyChars(b) - summaryBodyChars(a));
         result.toCompress = groups[0] || [];
         result.skipped = candidates.filter(s => !result.toCompress.includes(s));
-        if (result.toCompress.length < 2) {
-            result.reason = '待压缩段不足 2 段（' + result.toCompress.length + ' 段），压缩无意义，已跳过。';
+        result.inputChars = summaryBodyChars(result.toCompress);
+        result.reservedChars = summaryBodyChars([...result.skipped, ...result.fresh]) + result.threadChars;
+        result.outputLimit = Math.min(result.inputChars - 1,
+            result.targetChars > 0 ? result.targetChars - result.reservedChars : Infinity);
+        if (result.targetChars > 0 && result.reservedChars >= result.targetChars) {
+            result.reason = '本次保留的总结与脉络共 ' + result.reservedChars + ' 字，已占满目标 ' + result.targetChars
+                + ' 字。请减少保鲜段数、降低保底字数（均可设 0）、提高目标，或精简事件脉络。';
+            return result;
+        }
+        if (!result.toCompress.length || result.outputLimit < 1) {
+            result.reason = '没有可压缩的总结：保鲜段和保底段会保留，单独一段需至少 ' + MIN_SINGLE_COMPRESS_CHARS
+                + ' 字。可将保鲜或保底设为 0 后重试。';
             return result;
         }
 
@@ -5729,6 +5806,7 @@ let activePopupHandle = null;
 
         isCompressing = true;
         var compressOwner = captureChat();
+        var previousInjectionBackup, injectionBackupCreated = false, injectionWriteStarted = false;
         try {
             var plan = await prepareCompressionPlan();
             requireCurrentChat(compressOwner);
@@ -5744,13 +5822,20 @@ let activePopupHandle = null;
                     segmentSources: JSON.parse(JSON.stringify(readChatMemory().lorebookSegmentSources[source.sourceKey] || {})),
                     savedAt: Date.now() };
                 saveLorebookCompressionBackup(backup);
-            } else if (!backupMemoryBeforeCompress()) {
-                throw new Error('压缩前备份失败，已停止压缩。');
+            } else {
+                previousInjectionBackup = getLiveChatMetadata()?.[CHAT_META_KEY + '_' + BACKUP_FIELD];
+                if (!backupMemoryBeforeCompress()) throw new Error('压缩前备份失败，已停止压缩。');
+                injectionBackupCreated = true;
             }
 
             // 2. 调 API
             var inputText = joinSegmentsForCompress(plan.toCompress);
-            var userPrompt = '以下是需要压缩的剧情摘要：\n\n' + inputText + '\n\n请按要求压缩以上内容：';
+            var budgetInstruction = '\n\n【本次字数预算】\n待压缩正文共 ' + plan.inputChars + ' 字；本次输出最多 '
+                + plan.outputLimit + ' 字，必须比原正文短。'
+                + (plan.targetChars > 0 ? '压缩后总结正文与事件脉络合计不得超过 ' + plan.targetChars
+                    + ' 字，其中本次原样保留的总结与脉络占 ' + plan.reservedChars + ' 字。' : '')
+                + '字数按文本长度计算。直接输出压缩后的剧情正文，不输出说明、字数统计或代码块。不得新增事实。';
+            var userPrompt = '以下是需要压缩的剧情摘要：\n\n' + inputText + budgetInstruction + '\n\n请按要求压缩以上内容：';
 
             if ($statusMessageSpan) $statusMessageSpan.text('正在压缩记忆…');
             showToastr('info', '正在压缩 ' + plan.toCompress.length + ' 段记忆…');
@@ -5761,6 +5846,12 @@ let activePopupHandle = null;
             requireCurrentChat(compressOwner);
             if (!compressed || compressed.trim() === '') {
                 throw new Error('AI 未返回有效的压缩内容。');
+            }
+            compressed = compressed.trim();
+            validateCompressionOutput(plan, compressed);
+            if (compressOwner.mode === STORAGE_MODE_INJECT
+                && JSON.stringify(readChatMemory().segments) !== JSON.stringify(source.segments)) {
+                throw new Error('压缩期间总结已被修改，未覆盖新内容，请重新查看后压缩。');
             }
 
             // 3. 组装新段（到这一步才开始改数据）
@@ -5793,27 +5884,39 @@ let activePopupHandle = null;
             rebuilt.sort(function (a, b) { return a.startFloor - b.startFloor; });
 
             if (compressOwner.mode === STORAGE_MODE_LOREBOOK) {
-                await writeLorebookCompression(source, rebuilt, backup);
+                await writeLorebookCompression(source, rebuilt, backup, () => validateCompressionOutput(plan, compressed));
             } else {
                 mem.segments = rebuilt;
+                injectionWriteStarted = true;
                 var writeOk = writeChatMemory(mem);
                 if (!writeOk) {
                     throw new Error('压缩结果写入失败。原数据已备份，可点击"撤销压缩"恢复。');
                 }
                 refreshInjection();
             }
-            var afterChars = rebuilt.reduce((n, s) => n + s.text.length, 0);
+            var afterChars = summaryBodyChars(rebuilt);
             var saved = beforeChars - afterChars;
-            var msg = '压缩完成：' + beforeChars + ' → ' + afterChars + ' 字（省下 ' + saved + ' 字）';
+            var totalAfter = afterChars + threadBodyChars();
+            var msg = '压缩完成：总结 ' + beforeChars + ' → ' + afterChars + ' 字（省下 ' + saved + ' 字）；含事件脉络共 '
+                + totalAfter + ' 字' + (plan.targetChars ? '，目标 ' + plan.targetChars + ' 字' : '');
             logDebug('[压缩] ' + msg);
             if ($statusMessageSpan) $statusMessageSpan.text(msg);
             showToastr('success', msg);
 
             if (typeof updateMemoryPanel === 'function') updateMemoryPanel();
 
-            return { ok: true, message: msg, before: beforeChars, after: afterChars };
+            return { ok: true, message: msg, before: beforeChars, after: afterChars,
+                totalBefore: beforeChars + plan.threadChars, totalAfter, targetChars: plan.targetChars };
 
         } catch (e) {
+            if (injectionBackupCreated && !injectionWriteStarted && isCurrentChat(compressOwner)) {
+                try {
+                    var meta = getLiveChatMetadata(), key = CHAT_META_KEY + '_' + BACKUP_FIELD;
+                    if (previousInjectionBackup === undefined) delete meta[key];
+                    else meta[key] = previousInjectionBackup;
+                    getLiveSaveMetadata()?.();
+                } catch (backupError) { logError('[压缩] 恢复上一份备份失败:', backupError); }
+            }
             if (compressOwner.mode === STORAGE_MODE_LOREBOOK && backup && isCurrentChat(compressOwner) && !source?.recoveryNeeded) {
                 try { saveLorebookCompressionBackup(previousLorebookBackup); }
                 catch (backupError) { logError('[压缩] 恢复上一份备份失败:', backupError); }
@@ -6006,8 +6109,8 @@ let activePopupHandle = null;
      * 总结完成后调用：检查是否需要自动压缩。
      *
      * 设计要点：
-     * · 两种模式都只统计当前聊天的总结正文
-     * · 任何一步不满足条件都静默返回，绝不打断总结流程
+     * · 两种模式都统计当前聊天的总结正文与事件脉络
+     * · 达到阈值但被保护规则阻塞时显示原因，不打断总结流程
      * · 压缩失败不抛出异常，只记录日志——总结已经成功了，不能因为压缩失败让用户以为总结也失败了
      */
     async function checkAndRunAutoCompress() {
@@ -6016,7 +6119,7 @@ let activePopupHandle = null;
             if (isCompressing) return;
             if (isAutoSummarizing) return;
             var plan = await prepareCompressionPlan();
-            var chars = plan.beforeChars;
+            var chars = plan.totalChars;
             var threshold = currentCompressThreshold;
             if (isNaN(threshold) || threshold < 1000) threshold = DEFAULT_COMPRESS_THRESHOLD;
 
@@ -6027,6 +6130,7 @@ let activePopupHandle = null;
 
             if (!plan.ok) {
                 logDebug('[自动压缩] 条件不满足：' + plan.reason);
+                showToastr('warning', '记忆已达 ' + chars + ' 字，但无法自动压缩：' + plan.reason);
                 return;
             }
 
@@ -6476,3 +6580,4 @@ let activePopupHandle = null;
     }
 
 })();
+

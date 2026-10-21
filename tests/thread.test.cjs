@@ -72,6 +72,14 @@ function harness() {
                 if ('floor' in settings) currentCompressFloorChars = settings.floor;
                 if ('auto' in settings) autoCompressEnabled = settings.auto;
                 if ('threshold' in settings) currentCompressThreshold = settings.threshold;
+                if ('target' in settings) currentCompressTargetChars = settings.target;
+            },
+            compressionStorage: function (settings) {
+                if ('fresh' in settings) localStorage.setItem(STORAGE_KEY_FRESH_COUNT, String(settings.fresh));
+                if ('floor' in settings) localStorage.setItem(STORAGE_KEY_COMPRESS_FLOOR, String(settings.floor));
+                if ('target' in settings) localStorage.setItem(STORAGE_KEY_COMPRESS_TARGET, String(settings.target));
+                loadSettings();
+                return { fresh: currentFreshCount, floor: currentCompressFloorChars, target: currentCompressTargetChars };
             },
             threadOptions: getThreadRequestOptions, deleteProfile: deleteCurrentApiProfile,
             remove: function (ids) {
@@ -266,7 +274,7 @@ test('空总结不触发重建，也不清空手动脉络', async () => {
 
 test('压缩保留节点与来源 ID；回退删除整个压缩段时同步删来源节点', async () => {
     const h = harness(), p = h.plugin;
-    p.append(0, 9, '一'); p.append(10, 19, '二'); p.append(20, 29, '三');
+    p.append(0, 9, '第一段旧剧情'); p.append(10, 19, '第二段旧剧情'); p.append(20, 29, '三');
     h.replies.push(jsonResponse('[一] 初遇'), jsonResponse('[二] 相爱'), jsonResponse('[三] 分手'));
     await p.weave('summary_0_9', '一', {}); await p.weave('summary_10_19', '二', {}); await p.weave('summary_20_29', '三', {});
     const nodes = clone(p.read().threadNodes);
@@ -280,7 +288,7 @@ test('压缩保留节点与来源 ID；回退删除整个压缩段时同步删�
 
 test('压缩后重建使用现存总结，撤销压缩不改用户脉络', async () => {
     const h = harness(), p = h.plugin;
-    p.append(0, 9, '一'); p.append(10, 19, '二'); p.append(20, 29, '三');
+    p.append(0, 9, '第一段旧剧情'); p.append(10, 19, '第二段旧剧情'); p.append(20, 29, '三');
     h.replies.push(jsonResponse('合并'), jsonResponse('[一二] 合并节点'), jsonResponse('[三] 三节点'));
     await p.compress();
     assert.equal(await p.rebuild(), true);
@@ -582,7 +590,7 @@ test('世界书自动压缩按世界书正文阈值触发并使用独立压缩�
 test('世界书保底段和楼层空隙不会被包进重叠压缩区间', async () => {
     const h = await worldCompressionFixture(), p = h.plugin;
     h.entries[0].comment = '小总结-Chat-A-1-60';
-    h.entries[0].content = '---\n[1-10]\n一\n---\n[已压缩·1代 11-20]\n保底\n---\n[21-30]\n三\n---\n[31-40]\n四\n---\n[51-60]\n保鲜';
+    h.entries[0].content = '---\n[1-10]\n一\n---\n[已压缩·1代 11-20]\n保底\n---\n[21-30]\n第三段剧情\n---\n[31-40]\n第四段剧情\n---\n[51-60]\n保鲜';
     const plan = await p.prepareCompression();
     assert.deepEqual(clone(plan.toCompress.map(s => [s.startFloor, s.endFloor])), [[20, 29], [30, 39]]);
     h.replies.push(jsonResponse('三四合并'));
@@ -675,7 +683,7 @@ test('世界书大总结可压缩，小总结和其他类型的来源关联不�
     h.entries[0].enabled = false;
     const large = h.entries.find(e => e.uid === 10);
     large.enabled = true;
-    large.content = '---\n[1-10]\n大一\n---\n[11-20]\n大二\n---\n[21-30]\n大三';
+    large.content = '---\n[1-10]\n第一段大总结剧情\n---\n[11-20]\n第二段大总结剧情\n---\n[21-30]\n大三';
     p.summaryType('large');
     const small = clone(h.entries[0]);
     h.replies.push(jsonResponse('大总结压缩'));
@@ -871,3 +879,171 @@ test('默认跟随复用传入的本轮总结配置快照，且与压缩选择�
     snapshot.model = 'changed';
     assert.equal(result.apiConfig.model, 'snapshot-model');
 });
+
+function budgetFixture(mode, segments, threadText = '') {
+    const h = harness(), p = h.plugin;
+    p.mode(mode);
+    const nodes = threadText ? [{ id: 'node', layerId: 'manual', text: threadText }] : [];
+    if (mode === 'inject') p.write({ ...p.read(), segments, threadNodes: nodes });
+    else {
+        p.write({ ...p.read(), threadNodes: nodes });
+        h.entries.push({ uid: 1, enabled: true, type: 'constant', keys: [],
+            comment: '小总结-Chat-A-' + (segments[0].startFloor + 1) + '-' + (segments.at(-1).endFloor + 1),
+            content: segments.map(s => '---\n[' + (s.gen ? '已压缩·' + s.gen + '代 ' : '')
+                + (s.startFloor + 1) + '-' + (s.endFloor + 1) + ']\n' + s.text).join('\n') });
+    }
+    return h;
+}
+
+function budgetSegment(startFloor, endFloor, chars, gen = 0) {
+    return { layerId: 'summary_' + startFloor + '_' + endFloor, startFloor, endFloor, gen,
+        text: '剧情'.repeat(Math.ceil(chars / 2)).slice(0, chars) };
+}
+
+test('保鲜、保底和目标的零值经过账户存储与重载仍保留，旧设置获得目标默认值', () => {
+    const h = harness(), p = h.plugin;
+    assert.deepEqual(clone(p.compressionStorage({})), { fresh: 3, floor: 2000, target: 6000 });
+    assert.deepEqual(clone(p.compressionStorage({ fresh: 0, floor: 0, target: 0 })), { fresh: 0, floor: 0, target: 0 });
+    assert.deepEqual(clone(p.compressionStorage({})), { fresh: 0, floor: 0, target: 0 });
+    assert.equal(h.settings.autoSummaryWorldbookAdv.freshCount, 0);
+    assert.equal(h.settings.autoSummaryWorldbookAdv.compressFloorChars, 0);
+    assert.deepEqual(clone(p.compressionStorage({ target: 2400 })), { fresh: 0, floor: 0, target: 2400 });
+});
+
+for (const mode of ['inject', 'lorebook']) {
+    test(mode + '一万字旧总结可以单段再压缩，最新保鲜段原样保留', async () => {
+        const h = budgetFixture(mode, [budgetSegment(0, 99, 10000, 1), budgetSegment(100, 109, 1200)]), p = h.plugin;
+        p.compressionSettings({ target: 6000 });
+        const plan = await p.prepareCompression();
+        assert.equal(plan.ok, true);
+        assert.equal(plan.toCompress.length, 1);
+        assert.equal(plan.outputLimit, 4800);
+        h.replies.push(jsonResponse('压'.repeat(4000)));
+        const result = await p.compress();
+        assert.equal(result.ok, true);
+        assert.equal(result.totalAfter, 5200);
+        const segments = mode === 'inject' ? p.read().segments : p.lorebookSegments(h.entries[0]);
+        assert.equal(segments[0].gen, 2);
+        assert.equal(segments[0].endFloor, 99);
+        assert.equal(segments[1].text.length, 1200);
+        assert.equal(await p.restoreCompression(), 2);
+    });
+
+    test(mode + '保鲜与保底关闭后，仅一段已压缩记忆也能继续压缩', async () => {
+        const h = budgetFixture(mode, [budgetSegment(0, 99, 1800, 2)]), p = h.plugin;
+        p.compressionSettings({ fresh: 0, floor: 0, target: 0 });
+        const plan = await p.prepareCompression();
+        assert.equal(plan.ok, true);
+        assert.equal(plan.fresh.length, 0);
+        h.replies.push(jsonResponse('压'.repeat(700)));
+        assert.equal((await p.compress()).ok, true);
+        const segments = mode === 'inject' ? p.read().segments : p.lorebookSegments(h.entries[0]);
+        assert.equal(segments.length, 1);
+        assert.equal(segments[0].gen, 3);
+    });
+
+    test(mode + '不足二百字的单段仍会跳过，不产生无意义调用', async () => {
+        const h = budgetFixture(mode, [budgetSegment(0, 9, 199)]), p = h.plugin;
+        p.compressionSettings({ fresh: 0, floor: 0, target: 0 });
+        assert.equal((await p.compress()).ok, false);
+        assert.equal(h.requests.length, 0);
+    });
+
+    test(mode + '多段保底超目标时可关闭保护合并压缩，无需积累两段新总结', async () => {
+        const h = budgetFixture(mode, [...[0, 10, 20, 30].map(start => budgetSegment(start, start + 9, 1800, 1)),
+            budgetSegment(40, 49, 1200)]), p = h.plugin;
+        p.compressionSettings({ target: 6000 });
+        assert.equal((await p.prepareCompression()).ok, false);
+        p.compressionSettings({ floor: 0 });
+        const plan = await p.prepareCompression();
+        assert.equal(plan.toCompress.length, 4);
+        h.replies.push(jsonResponse('压'.repeat(1500)));
+        assert.equal((await p.compress()).ok, true);
+    });
+
+    test(mode + '目标扣除保鲜与事件脉络，只给待压缩正文分配剩余预算', async () => {
+        const h = budgetFixture(mode, [budgetSegment(0, 9, 3000), budgetSegment(10, 19, 3000),
+            budgetSegment(20, 29, 500)], '线'.repeat(400)), p = h.plugin;
+        p.compressionSettings({ target: 2000 });
+        const plan = await p.prepareCompression();
+        assert.equal(plan.beforeChars, 6500);
+        assert.equal(plan.totalChars, 6900);
+        assert.equal(plan.outputLimit, 1100);
+        h.replies.push(jsonResponse('压'.repeat(1000)));
+        const result = await p.compress();
+        assert.equal(result.ok, true);
+        assert.equal(result.totalAfter, 1900);
+        assert.match(h.requests[0].body.messages[1].content, /本次输出最多 1100 字/);
+        assert.equal(p.read().threadNodes[0].text, '线'.repeat(400));
+    });
+
+    test(mode + '保护内容已占满目标时提前停止，不调用模型也不改备份', async () => {
+        const h = budgetFixture(mode, [budgetSegment(0, 9, 6000), budgetSegment(10, 19, 1200)], '线'.repeat(900)), p = h.plugin;
+        p.compressionSettings({ target: 2000 });
+        const before = clone(h.metadata), entries = clone(h.entries);
+        const result = await p.compress();
+        assert.equal(result.ok, false);
+        assert.match(result.message, /占满目标/);
+        assert.equal(h.requests.length, 0);
+        assert.deepEqual(clone(h.metadata), before);
+        assert.deepEqual(h.entries, entries);
+    });
+
+    for (const [name, length, error] of [['相同长度', 6000, /未缩短/], ['反而变长', 6001, /未缩短/], ['缩短但超目标', 2500, /超过目标/]]) {
+        test(mode + '模型返回' + name + '时保留原记忆与上次备份，不截断或额外重发', async () => {
+            const h = budgetFixture(mode, [budgetSegment(0, 99, 6000)]), p = h.plugin;
+            p.compressionSettings({ fresh: 0, floor: 0, target: 2000 });
+            const key = mode === 'inject' ? 'autoSummaryAdv_v1_backup' : 'autoSummaryAdv_v1_backup_lorebook';
+            h.metadata[key] = { savedAt: 123, previous: '上一次备份' };
+            const memory = clone(p.read()), entries = clone(h.entries), backup = clone(h.metadata[key]);
+            h.replies.push(jsonResponse('压'.repeat(length)));
+            const result = await p.compress();
+            assert.equal(result.ok, false);
+            assert.match(result.message, error);
+            assert.deepEqual(clone(p.read()), memory);
+            assert.deepEqual(h.entries, entries);
+            assert.deepEqual(clone(h.metadata[key]), backup);
+            assert.equal(h.requests.length, 1);
+        });
+    }
+
+    test(mode + '自动压缩把脉络计入触发总量，保护阻塞时给出可见提醒', async () => {
+        const h = budgetFixture(mode, [budgetSegment(0, 9, 1000), budgetSegment(10, 19, 100)], '线'.repeat(700)), p = h.plugin;
+        p.compressionSettings({ auto: true, threshold: 1500, target: 1200 });
+        h.replies.push(jsonResponse('压'.repeat(300)));
+        await p.autoCompress();
+        assert.equal(h.requests.length, 1);
+        p.compressionSettings({ target: 100 });
+        await p.saveEdited('线'.repeat(2000));
+        await p.autoCompress();
+        assert.equal(h.requests.length, 1);
+        assert.ok(h.toasts.some(text => /无法自动压缩/.test(text)));
+    });
+
+    test(mode + '请求期间手改脉络会按最新长度检查预算，失败保留手改内容', async () => {
+        const h = budgetFixture(mode, [budgetSegment(0, 99, 6000)]), p = h.plugin;
+        p.compressionSettings({ fresh: 0, floor: 0, target: 2000 });
+        h.replies.push(async () => {
+            await p.saveEdited('新'.repeat(1900));
+            return jsonResponse('压'.repeat(300));
+        });
+        const result = await p.compress();
+        assert.equal(result.ok, false);
+        assert.match(result.message, /超过目标/);
+        assert.equal(p.read().threadNodes[0].text, '新'.repeat(1900));
+        const segments = mode === 'inject' ? p.read().segments : p.lorebookSegments(h.entries[0]);
+        assert.equal(segments[0].text.length, 6000);
+    });
+}
+
+test('注入压缩等待期间手改总结不会被旧结果覆盖', async () => {
+    const h = budgetFixture('inject', [budgetSegment(0, 99, 6000)]), p = h.plugin;
+    p.compressionSettings({ fresh: 0, floor: 0, target: 2000 });
+    h.replies.push(() => {
+        p.append(0, 99, '用户新写的总结');
+        return jsonResponse('压'.repeat(500));
+    });
+    assert.equal((await p.compress()).ok, false);
+    assert.equal(p.read().segments[0].text, '用户新写的总结');
+});
+
