@@ -90,6 +90,12 @@ function harness() {
             },
             summary: proceedWithSummarization, initialize: mainInitializeSummarizer,
             maxLorebookFloor: getMaxSummarizedFloorFromActiveLorebookEntry,
+            coverage: readActiveSummarySegments, planChunks: planSummaryChunks,
+            syncStatus: applyPersistedSummaryStatusFromLorebook, visibility: applyActualMessageVisibility,
+            get messages() { return allChatMessages; },
+            reserve: function (n) { currentReserveCount = n; },
+            batch: handleAutoSummarize,
+            prepareBatch: function () { syncCustomApiConfigFromActiveProfile(); bulkConfirmEnabled = false; },
             syncMemory: syncThreadInjection, manageLorebook: manageSummaryLorebookEntries,
             setSummaryHeader: function (text) { currentLorebookHeaderText = text; },
             get summaryHeader() { return DEFAULT_LOREBOOK_HEADER_TEXT; },
@@ -118,7 +124,15 @@ function harness() {
     return {
         plugin, api, context, helper, entries, requests, replies, toasts, settings, injections, events,
         get metadata() { return metadata; }, get saves() { return saves; },
-        switchChat(name, next = {}) { metadata = next; plugin.switchChat(name); }
+        switchChat(name, next = {}) { metadata = next; plugin.switchChat(name); },
+        enableBatch() {
+            window.TavernHelper = helper;
+            window.jQuery = () => ({ length: 0 });
+            window.toastr = { warning: text => toasts.push(text), error: text => toasts.push(text),
+                info: text => toasts.push(text), success: text => toasts.push(text) };
+            sandbox.setTimeout = callback => setTimeout(callback, 0);
+            plugin.prepareBatch();
+        }
     };
 }
 
@@ -226,9 +240,10 @@ test('切换聊天时隔离存储并拒绝旧响应，即使切回原聊天', as
 });
 
 test('总结请求期间切换聊天，不把旧总结保存到新聊天', async () => {
-    const h = harness(), hold = deferred();
-    h.replies.push(() => hold.promise);
+    const h = harness(), hold = deferred(), sent = deferred();
+    h.replies.push(() => { sent.resolve(); return hold.promise; });
     const work = h.plugin.summary(0, 9, false);
+    await sent.promise;
     h.switchChat('Chat-B');
     hold.resolve(jsonResponse('旧聊天总结'));
     assert.equal(await work, false);
@@ -1047,3 +1062,98 @@ test('注入压缩等待期间手改总结不会被旧结果覆盖', async () =>
     assert.equal(p.read().segments[0].text, '用户新写的总结');
 });
 
+
+for (const mode of ['inject', 'lorebook']) {
+    test(mode + '删除中间总结后按实际区间同步进度，补缺不覆盖后面的总结', async () => {
+        const h = budgetFixture(mode, [budgetSegment(0, 9, 200), budgetSegment(20, 29, 200)]), p = h.plugin;
+        p.reserve(5);
+        await p.syncStatus();
+        assert.equal(p.messages[0].summarized, true);
+        assert.equal(p.messages[10].summarized, false);
+        assert.equal(p.messages[20].summarized, true);
+        const plan = await p.planChunks(10);
+        assert.deepEqual(clone(plan.chunks), [[10, 19], [30, 39]]);
+        assert.equal(plan.missing, 30);
+        h.replies.push(jsonResponse('重新总结的正确剧情'), jsonResponse('[新] 正确事件'));
+        assert.equal(await p.summary(10, 19, mode === 'lorebook'), true);
+        const segments = await p.coverage();
+        assert.equal(segments.length, 3);
+        assert.equal(segments.find(s => s.startFloor === 20).text.length, 200);
+        assert.equal(segments.find(s => s.startFloor === 10).text, '重新总结的正确剧情');
+    });
+
+    test(mode + '同范围可以直接重跑，失败保留旧总结，成功替换对应脉络而非追加', async () => {
+        const h = budgetFixture(mode, [budgetSegment(0, 9, 200)]), p = h.plugin;
+        h.replies.push(new Response('bad', { status: 503 }));
+        assert.equal(await p.summary(0, 9, mode === 'lorebook'), false);
+        assert.equal((await p.coverage())[0].text.length, 200);
+        for (const text of ['第一次更正', '再次更正']) {
+            h.replies.push(jsonResponse(text), jsonResponse('[新] ' + text));
+            assert.equal(await p.summary(0, 9, mode === 'lorebook'), true);
+        }
+        assert.equal((await p.coverage()).length, 1);
+        assert.equal((await p.coverage())[0].text, '再次更正');
+        assert.equal(p.read().threadNodes.length, 1);
+        assert.equal(p.read().threadNodes[0].text, '[新] 再次更正');
+    });
+
+    test(mode + '删除记忆后只恢复缺失区间里结绳自己隐藏的楼层', async () => {
+        const h = budgetFixture(mode, [budgetSegment(20, 29, 200)]), p = h.plugin;
+        h.context.chat[0] = { is_system: true, extra: { asAdvHidden: true } };
+        h.context.chat[1] = { is_system: true }; // 用户或其他插件隐藏
+        h.context.chat[20] = { is_system: true, extra: { asAdvHidden: true } };
+        await p.visibility();
+        assert.equal(h.context.chat[0].is_system, false);
+        assert.equal(h.context.chat[1].is_system, true);
+        assert.equal(h.context.chat[20].is_system, true);
+    });
+}
+
+test('世界书清空正文但保留旧范围标题、脉络和头部，不再算作已总结', async () => {
+    const h = budgetFixture('lorebook', [budgetSegment(0, 49, 200)]), p = h.plugin;
+    await p.syncMemory();
+    h.entries[0].content = p.summaryHeader + '\n\n---\n[1-50]\n';
+    assert.equal(await p.maxLorebookFloor(), -1);
+    await p.syncStatus();
+    assert.ok(p.messages.every(m => !m.summarized));
+    p.reserve(0);
+    assert.equal((await p.planChunks(10)).chunks.length, 5);
+    h.replies.push(jsonResponse('清空后重新总结'), jsonResponse('[新] 事件'));
+    assert.equal(await p.summary(0, 9, true), true);
+    assert.equal(await p.maxLorebookFloor(), 9);
+});
+
+test('世界书只删除最后段的正文，旧条目标题不会抬高总结进度', async () => {
+    const h = budgetFixture('lorebook', [budgetSegment(0, 9, 200)]), p = h.plugin;
+    h.entries[0].comment = '小总结-Chat-A-1-50';
+    h.entries[0].content += '\n---\n[11-50]\n';
+    assert.equal(await p.maxLorebookFloor(), 9);
+});
+
+test('世界书多个条目重跑同范围时替换准确条目，其他范围保持原值', async () => {
+    const h = budgetFixture('lorebook', [budgetSegment(0, 9, 200)]), p = h.plugin;
+    h.entries.push({ uid: 2, enabled: true, type: 'constant', comment: '小总结-Chat-A-11-20', content: '第二段旧剧情' });
+    h.replies.push(jsonResponse('第二段新剧情'), jsonResponse('[新] 事件'));
+    assert.equal(await p.summary(10, 19, true), true);
+    assert.equal(p.lorebookSegments(h.entries[0])[0].text.length, 200);
+    assert.equal(p.lorebookSegments(h.entries[1])[0].text, '第二段新剧情');
+});
+
+test('内部不足一整块的缺口可以补齐，末尾保留区不被重新总结', async () => {
+    const h = budgetFixture('inject', [budgetSegment(0, 4, 200), budgetSegment(8, 49, 200)]), p = h.plugin;
+    p.reserve(5);
+    assert.deepEqual(clone((await p.planChunks(10)).chunks), [[5, 7]]);
+});
+
+for (const mode of ['inject', 'lorebook']) test(mode + '实际执行批量补缺，仅请求缺失区间，保留后续总结和末尾保留区', async () => {
+    const h = budgetFixture(mode, [budgetSegment(0, 9, 200), budgetSegment(20, 29, 200)]), p = h.plugin;
+    h.enableBatch(); p.reserve(5);
+    h.replies.push(jsonResponse('补回十到十九'), jsonResponse('[新] 补缺'),
+        jsonResponse('补回三十到三十九'), jsonResponse('[新] 后续'));
+    await p.batch();
+    assert.equal(h.requests.length, 4, h.toasts.join('\n'));
+    const segments = await p.coverage();
+    assert.deepEqual(clone(segments.map(s => [s.startFloor, s.endFloor])), [[0, 9], [10, 19], [20, 29], [30, 39]]);
+    assert.equal(segments.find(s => s.startFloor === 20).text.length, 200);
+    assert.equal(h.replies.length, 0);
+});

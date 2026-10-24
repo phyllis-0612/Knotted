@@ -1166,15 +1166,12 @@ let activePopupHandle = null;
      * 返回一个对象，键是楼层号，值恒为 true。用对象而不是 Set，兼容老环境。
      * 只有在这个集合里的楼层才有资格被隐藏——不在集合里就隐藏，等于制造信息黑洞。
      */
-    function buildCoveredFloorMap() {
+    function buildCoveredFloorMap(segments = readChatMemory().segments) {
         var covered = {};
-        if (currentStorageMode !== STORAGE_MODE_INJECT) {
-            // 世界书模式：退回旧行为，认为 0..maxFloor 全部被覆盖
-            return null;
-        }
-        var mem = readChatMemory();
-        for (var i = 0; i < mem.segments.length; i++) {
-            var s = mem.segments[i];
+        var header = readChatMemory().header;
+        for (var i = 0; i < segments.length; i++) {
+            var s = segments[i];
+            if (!stripSummaryHeaders(s.text, [header]).trim()) continue;
             for (var f = s.startFloor; f <= s.endFloor; f++) {
                 covered[f] = true;
             }
@@ -1293,10 +1290,7 @@ let activePopupHandle = null;
             return;
         }
 
-        var maxSummarizedFloor = await getMaxSummarizedFloor();
-
-        // 覆盖集合。世界书模式返回 null，此时退回「0..maxFloor 全部覆盖」的旧语义。
-        var covered = buildCoveredFloorMap();
+        var covered = buildCoveredFloorMap(await readActiveSummarySegments());
 
         // 保留窗口：末尾 N 楼永远可见
         var keep = currentKeepVisibleCount;
@@ -1313,11 +1307,7 @@ let activePopupHandle = null;
 
             // 是否被总结覆盖
             var isCovered;
-            if (covered === null) {
-                isCovered = (i <= maxSummarizedFloor);
-            } else {
-                isCovered = (covered[i] === true);
-            }
+            isCovered = (covered[i] === true);
 
             // 判定规则：被覆盖 且 在保留窗口之前 → 应隐藏
             var shouldBeHidden = isCovered && (i < windowStart);
@@ -1789,56 +1779,48 @@ let activePopupHandle = null;
         return await getMaxSummarizedFloorFromActiveLorebookEntry();
     }
 
-    async function getMaxSummarizedFloorFromActiveLorebookEntry() {
-        if (!currentPrimaryLorebook || !currentChatFileIdentifier || currentChatFileIdentifier.startsWith('unknown_chat')) {
-            return -1;
+    async function readActiveSummarySegments() {
+        var owner = captureChat();
+        if (owner.mode === STORAGE_MODE_INJECT) {
+            return readChatMemory().segments.filter(s => stripSummaryHeaders(s.text, [readChatMemory().header]).trim());
         }
-        try {
-            const owner = captureChat();
-            const entries = await TavernHelper_API.getLorebookEntries(currentPrimaryLorebook);
-            requireCurrentChat(owner);
-            // 即使脉络未变，也要清理旧总结中重复的头部说明。
-            await syncThreadInjection(owner, entries);
-            let maxFloor = -1;
-            // Determine the prefix based on the currently selected summary type
-            const currentPrefix = selectedSummaryType === 'small' ? SUMMARY_LOREBOOK_SMALL_PREFIX : SUMMARY_LOREBOOK_LARGE_PREFIX;
-
-            for (const entry of entries) {
-                // Only consider entries for the currently selected summary type and current chat
-                if (entry.enabled && entry.comment && entry.comment.startsWith(currentPrefix + currentChatFileIdentifier + "-")) {
-                    const match = entry.comment.match(/-(\d+)-(\d+)$/); // Matches against the end part like "-1-10"
-                    if (match && match.length === 3) {
-                        const endFloorInEntry = parseInt(match[2], 10); // Get the end floor from the entry name
-                        if (!isNaN(endFloorInEntry)) {
-                            maxFloor = Math.max(maxFloor, endFloorInEntry -1); // Store the highest end floor found (0-based)
-                        }
-                    }
-                }
-            }
-            logDebug(`Max summarized floor for type '${selectedSummaryType}' in chat '${currentChatFileIdentifier}' is ${maxFloor} (using prefix ${currentPrefix})`);
-            return maxFloor;
-        } catch (error) {
-            logError("从世界书获取最大总结楼层时出错:", error);
-            return -1;
-        }
+        if (!currentPrimaryLorebook) return [];
+        var book = currentPrimaryLorebook, type = selectedSummaryType;
+        var entries = await currentLorebookSummaryEntries();
+        requireCurrentChat(owner);
+        if (book !== currentPrimaryLorebook || type !== selectedSummaryType) throw new Error('世界书或总结类型已切换，请重试。');
+        await syncThreadInjection(owner, entries);
+        requireCurrentChat(owner);
+        return entries.flatMap(lorebookSummarySegments);
     }
-    async function applyPersistedSummaryStatusFromLorebook() { /* ... (no change) ... */
-        if (allChatMessages.length === 0) {
-            logDebug("没有聊天记录，无需从世界书恢复状态。");
-            return;
-        }
-        allChatMessages.forEach(msg => msg.summarized = false);
-        const maxSummarizedFloor = await getMaxSummarizedFloor();
-        if (maxSummarizedFloor >= 0) {
-            logDebug(`从世界书检测到最大已总结楼层 (0-based): ${maxSummarizedFloor}`);
-            for (let i = 0; i <= maxSummarizedFloor && i < allChatMessages.length; i++) {
-                if (allChatMessages[i]) {
-                    allChatMessages[i].summarized = true;
-                }
+
+    async function getMaxSummarizedFloorFromActiveLorebookEntry() {
+        return (await readActiveSummarySegments()).reduce((max, s) => Math.max(max, s.endFloor), -1);
+    }
+
+    async function applyPersistedSummaryStatusFromLorebook() {
+        var covered = buildCoveredFloorMap(await readActiveSummarySegments());
+        allChatMessages.forEach((msg, i) => { msg.summarized = covered[i] === true; });
+    }
+
+    // 只处理实际未覆盖的连续区间；内部空缺可以短于常规分块，尾部仍遵守保留楼层与分块大小。
+    async function planSummaryChunks(chunkSize) {
+        var covered = buildCoveredFloorMap(await readActiveSummarySegments());
+        var total = allChatMessages.length, limit = Math.max(0, total - currentReserveCount);
+        var chunks = [], missing = 0;
+        for (var i = 0; i < total; i++) if (!covered[i]) missing++;
+        for (var start = 0; start < limit;) {
+            if (covered[start]) { start++; continue; }
+            var end = start;
+            while (end < total && !covered[end]) end++;
+            var bounded = Math.min(end, limit);
+            while (start + chunkSize <= bounded) {
+                chunks.push([start, start + chunkSize - 1]); start += chunkSize;
             }
-        } else {
-            logDebug("当前聊天在世界书中没有找到有效的已启用总结条目，或解析楼层失败。");
+            if (end < total && end <= limit && start < end) chunks.push([start, end - 1]);
+            start = end;
         }
+        return { chunks, missing };
     }
 
     //【90修改】自动触发总结逻辑
@@ -1882,12 +1864,9 @@ let activePopupHandle = null;
         const triggerThreshold = effectiveChunkSize + currentReserveCount; // This is the new 'N + X' threshold
         logDebug(`[Summarizer Auto-Trigger] Effective chunk size (N) = ${effectiveChunkSize}, Offset (X) = ${currentReserveCount}, Trigger Threshold (N+X) = ${triggerThreshold}`);
 
-        const maxSummarizedFloor = await getMaxSummarizedFloor();
-        const unsummarizedCount = allChatMessages.length - (maxSummarizedFloor + 1);
-        logDebug(`[Summarizer Auto-Trigger Check] Total msgs: ${allChatMessages.length}, MaxEndFloor: ${maxSummarizedFloor}, Unsummarized count: ${unsummarizedCount}, Threshold (N+X): ${triggerThreshold}`);
-
-        const shouldTrigger = unsummarizedCount >= triggerThreshold;
-        logDebug(`[Summarizer Auto-Trigger] Condition check (unsummarizedCount >= N + X): ${unsummarizedCount} >= ${triggerThreshold} -> ${shouldTrigger}`);
+        const pending = await planSummaryChunks(effectiveChunkSize);
+        const unsummarizedCount = pending.missing;
+        const shouldTrigger = pending.chunks.length > 0;
 
         if (shouldTrigger) {
             const owner = captureChat();
@@ -3295,7 +3274,7 @@ let activePopupHandle = null;
                                 </div>
                                 <div>
                                     <h2 class="header-title">手动单次总结</h2>
-                                    <p class="header-subtitle">指定楼层范围进行一次性总结</p>
+                                    <p class="header-subtitle">指定楼层范围总结；填写原段的完整范围可直接重跑并替换。部分重叠时需先删除对应旧段并保存。</p>
                                 </div>
                             </div>
                             <div class="header-right">
@@ -3723,7 +3702,7 @@ let activePopupHandle = null;
                 });
 
                 // 记忆：保存修改
-                jQuery_API(P + 'memory-save-button').on('click', function () {
+                jQuery_API(P + 'memory-save-button').on('click', async function () {
                     if (currentStorageMode !== STORAGE_MODE_INJECT) return;
                     if (isSummaryInFlight || isRebuildingThread || isCompressing) {
                         showToastr('info', '请等待当前总结、重建或压缩完成后再修改记忆。'); return;
@@ -3764,7 +3743,9 @@ let activePopupHandle = null;
                         threadRevision++;
                         refreshInjection();
                         reloadThreadEditor();
-                        applyActualMessageVisibility();
+                        await applyPersistedSummaryStatusFromLorebook();
+                        await applyActualMessageVisibility();
+                        updateUIDisplay();
                         if (typeof updateMemoryPanel === 'function') updateMemoryPanel();
                         showToastr('success', '记忆已保存，共 ' + segs.length + ' 段。');
                     } else {
@@ -3779,7 +3760,7 @@ let activePopupHandle = null;
                 });
 
                 // 记忆：清空
-                jQuery_API(P + 'memory-clear-button').on('click', function () {
+                jQuery_API(P + 'memory-clear-button').on('click', async function () {
                     if (currentStorageMode !== STORAGE_MODE_INJECT) return;
                     if (isSummaryInFlight || isRebuildingThread || isCompressing) {
                         showToastr('info', '请等待当前总结、重建或压缩完成后再清空记忆。'); return;
@@ -3793,7 +3774,9 @@ let activePopupHandle = null;
                     refreshInjection();
                     reloadMemoryEditor();
                     reloadThreadEditor(true);
-                    applyActualMessageVisibility();
+                    await applyPersistedSummaryStatusFromLorebook();
+                    await applyActualMessageVisibility();
+                    updateUIDisplay();
                     if (typeof updateMemoryPanel === 'function') updateMemoryPanel();
                     showToastr('success', '记忆已清空。');
                 });
@@ -4130,6 +4113,9 @@ let activePopupHandle = null;
                         reconcileLorebookThread(await TavernHelper_API.getLorebookEntries(currentPrimaryLorebook));
                         await syncThreadInjection();
                         reloadThreadEditor();
+                        await applyPersistedSummaryStatusFromLorebook();
+                        await applyActualMessageVisibility();
+                        updateUIDisplay();
                         showToastr("success", `世界书条目 "${worldbookEntryCache.comment}" 已成功保存！`);
                         logDebug(`Worldbook entry UID ${worldbookEntryCache.uid} updated successfully.`);
                         
@@ -4396,18 +4382,11 @@ let activePopupHandle = null;
             var total = allChatMessages.length;
             if (total === 0) return true;
 
-            var maxFloor = await getMaxSummarizedFloor();
-            var unsummarized = total - (maxFloor + 1);
-            if (unsummarized <= 0) return true;
-
             var chunk = getEffectiveChunkSize('bulk_precheck');
             if (isNaN(chunk) || chunk < 1) return true;
-
-            // 末尾保留的楼层不参与总结
-            var summarizable = unsummarized - currentReserveCount;
-            if (summarizable <= 0) return true;
-
-            var rounds = Math.floor(summarizable / chunk);
+            var pending = await planSummaryChunks(chunk);
+            var unsummarized = pending.missing;
+            var rounds = pending.chunks.length;
             if (rounds < BULK_CONFIRM_ROUNDS) {
                 // 轮数不多，不打扰
                 return true;
@@ -4501,21 +4480,10 @@ let activePopupHandle = null;
             const triggerThreshold = effectiveChunkSize + currentReserveCount;
             logDebug(`HandleAutoSummarize: 使用间隔(N): ${effectiveChunkSize}, 触发阈值(N+X): ${triggerThreshold}`);
 
-            let maxSummarizedFloor = await getMaxSummarizedFloor();
-            let nextChunkStartFloor = maxSummarizedFloor + 1;
-            let unsummarizedCount = allChatMessages.length - (maxSummarizedFloor + 1);
-
-            // Check for the very first summarization run
-            if (maxSummarizedFloor === -1 && unsummarizedCount < triggerThreshold) {
-                const thresholdMessage = `总楼层数 (${unsummarizedCount}) 小于首次触发阈值 (${triggerThreshold})，本次没有可执行的完整区块。`;
-                showToastr("info", thresholdMessage);
-                if($statusMessageSpan) $statusMessageSpan.text(`楼层数不足 ${triggerThreshold}。`);
-                updateBulkProgress('success', 0, 0, '无需执行', thresholdMessage);
-                return;
-            }
-
-            const totalRounds = Math.floor(Math.max(0, unsummarizedCount - currentReserveCount) / effectiveChunkSize);
-            const totalFloorsToProcess = totalRounds * effectiveChunkSize;
+            const pending = await planSummaryChunks(effectiveChunkSize);
+            let unsummarizedCount = pending.missing;
+            const totalRounds = pending.chunks.length;
+            const totalFloorsToProcess = pending.chunks.reduce((n, range) => n + range[1] - range[0] + 1, 0);
             bulkTotalRounds = Math.max(1, totalRounds);
             if (totalRounds <= 0) {
                 const noChunkMessage = `剩余 ${unsummarizedCount} 楼，尚未达到触发阈值 ${triggerThreshold}，本次没有可执行的完整区块。`;
@@ -4537,15 +4505,16 @@ let activePopupHandle = null;
             else showToastr("info", startMessage);
             updateBulkProgress('running', 0, totalRounds, `准备第 1 / ${totalRounds} 轮`, startMessage);
 
-            logDebug(`自动总结：已总结到 ${maxSummarizedFloor + 1} 楼。剩余未总结 ${unsummarizedCount} 楼。下次区块大小 ${effectiveChunkSize}。触发阈值 ${triggerThreshold}`);
+
             let completedRounds = 0;
             const bulkOwner = captureChat();
             bulkCompressOwner = bulkOwner;
 
-            while (unsummarizedCount >= triggerThreshold) {
+            let processedFloors = 0;
+            for (const [nextChunkStartFloor, nextChunkEndFloor] of pending.chunks) {
                 requireCurrentChat(bulkOwner);
-                logDebug(`自动总结循环：准备处理区块 (未总结 ${unsummarizedCount} >= 阈值 ${triggerThreshold})。当前 nextChunkStartFloor (0-based): ${nextChunkStartFloor}, 区块大小: ${effectiveChunkSize}`);
-                const currentStatusText = `正在总结 ${nextChunkStartFloor + 1} 至 ${nextChunkStartFloor + effectiveChunkSize} 楼...`;
+
+                const currentStatusText = `正在总结 ${nextChunkStartFloor + 1} 至 ${nextChunkEndFloor + 1} 楼...`;
                 if($statusMessageSpan) $statusMessageSpan.text(currentStatusText); else showToastr("info", currentStatusText);
                 var useStreamingForRound = streamSummaryEnabled;
                 if (useStreamingForRound) {
@@ -4559,7 +4528,7 @@ let activePopupHandle = null;
                 var lastStreamUiUpdate = 0;
                 const success = await summarizeAndUploadChunk(
                     nextChunkStartFloor,
-                    nextChunkStartFloor + effectiveChunkSize - 1,
+                    nextChunkEndFloor,
                     useStreamingForRound ? function (partialText) {
                         var now = Date.now();
                         if (now - lastStreamUiUpdate < 80) return;
@@ -4568,21 +4537,20 @@ let activePopupHandle = null;
                     } : null
                 );
                  if (!success) {
-                    throw new Error(lastSummaryErrorMessage || `区块 ${nextChunkStartFloor + 1}-${nextChunkStartFloor + effectiveChunkSize} 总结失败。`);
+                    throw new Error(lastSummaryErrorMessage || `区块 ${nextChunkStartFloor + 1}-${nextChunkEndFloor + 1} 总结失败。`);
                 }
                 requireCurrentChat(bulkOwner);
 
                 // Recalculate state after a successful chunk
                 completedRounds += 1;
                 bulkCompletedRounds = completedRounds;
-                maxSummarizedFloor += effectiveChunkSize;
-                nextChunkStartFloor += effectiveChunkSize;
-                unsummarizedCount -= effectiveChunkSize;
-                updateBulkProgress('running', completedRounds, totalRounds, `已完成第 ${completedRounds} / ${totalRounds} 轮`, `已处理 ${completedRounds * effectiveChunkSize} / ${totalFloorsToProcess} 楼，剩余 ${unsummarizedCount} 楼。`);
+                processedFloors += nextChunkEndFloor - nextChunkStartFloor + 1;
+                unsummarizedCount -= nextChunkEndFloor - nextChunkStartFloor + 1;
+                updateBulkProgress('running', completedRounds, totalRounds, `已完成第 ${completedRounds} / ${totalRounds} 轮`, `已处理 ${processedFloors} / ${totalFloorsToProcess} 楼，剩余 ${unsummarizedCount} 楼。`);
 
                 await applyPersistedSummaryStatusFromLorebook(); // This is good practice but our manual tracking is faster
                 updateUIDisplay();
-                logDebug(`自动总结：已总结到 ${maxSummarizedFloor + 1} 楼。剩余未总结 ${unsummarizedCount} 楼。`);
+
                 await new Promise(resolve => setTimeout(resolve, 500));
             }
 
@@ -4808,7 +4776,7 @@ let activePopupHandle = null;
         var range = (entry.comment || '').match(/-(\d+)-(\d+)$/);
         if (!range) return [];
         var body = stripSummaryHeaders(stripThreadPrefix(entry.content || ''), [readChatMemory().header]);
-        var markers = [...body.matchAll(/(?:^|\n)---\r?\n\[(?:已压缩·(\d+)代 )?(\d+)-(\d+)\]\r?\n/g)];
+        var markers = [...body.matchAll(/(?:^|\n)---\r?\n\[(?:已压缩·(\d+)代 )?(\d+)-(\d+)\](?:\r?\n|$)/g)];
         var segments = [];
         var sources = readChatMemory().lorebookSegmentSources[lorebookSourceKey()] || {};
         function add(start, end, text, gen = 0) {
@@ -5167,6 +5135,7 @@ let activePopupHandle = null;
         var mem = readChatMemory();
         var max = -1;
         for (var i = 0; i < mem.segments.length; i++) {
+            if (!stripSummaryHeaders(mem.segments[i].text, [mem.header]).trim()) continue;
             if (mem.segments[i].endFloor > max) max = mem.segments[i].endFloor;
         }
         return max;
@@ -5175,6 +5144,9 @@ let activePopupHandle = null;
     /** 追加一段新总结。startFloor / endFloor 都是 0-based 且含端点。 */
     function appendSummarySegment(startFloor, endFloor, text) {
         var mem = readChatMemory();
+        var empty = mem.segments.filter(s => !stripSummaryHeaders(s.text, [mem.header]).trim());
+        removeThreadNodesForSegments(mem, empty);
+        mem.segments = mem.segments.filter(s => !empty.includes(s));
         var existing = mem.segments.find(s => s.startFloor === startFloor && s.endFloor === endFloor);
         if (mem.segments.some(s => s !== existing && s.startFloor <= endFloor && s.endFloor >= startFloor)) {
             throw new Error('该楼层与已有记忆区间重叠。请先在记忆编辑框中删除对应段落，再重新总结。');
@@ -6322,8 +6294,9 @@ let activePopupHandle = null;
         let layerId = summaryLayerId(startInternalId, endInternalId);
         isSummaryInFlight = true;
         try {
-            if (owner.mode === STORAGE_MODE_INJECT) {
-                var segments = readChatMemory().segments;
+            {
+                var segments = await readActiveSummarySegments();
+                requireCurrentChat(owner);
                 var existingSegment = segments.find(s => s.startFloor === startInternalId && s.endFloor === endInternalId);
                 if (segments.some(s => s !== existingSegment && s.startFloor <= endInternalId && s.endFloor >= startInternalId)) {
                     throw new Error('该楼层与已有记忆区间重叠。请先删除对应段落，再重新总结。');
@@ -6362,7 +6335,10 @@ let activePopupHandle = null;
             if (currentStorageMode === STORAGE_MODE_LOREBOOK && shouldUploadToLorebook && currentPrimaryLorebook) {
                 const lorebookEntries = await TavernHelper_API.getLorebookEntries(currentPrimaryLorebook);
                 requireCurrentChat(owner);
-                const existingSummaryEntry = lorebookEntries.find(
+                const exactSummaryEntry = lorebookEntries.find(entry => entry.enabled
+                    && entry.comment?.startsWith(`${currentSummaryPrefix}${chatIdentifier}-`)
+                    && lorebookSummarySegments(entry).some(s => s.startFloor === startInternalId && s.endFloor === endInternalId));
+                const existingSummaryEntry = exactSummaryEntry || lorebookEntries.find(
                     entry => entry.comment && entry.comment.startsWith(`${currentSummaryPrefix}${chatIdentifier}-`) && entry.enabled
                 );
                 let combinedStartFloorDisplay = startInternalId + 1;
