@@ -2576,6 +2576,17 @@ let activePopupHandle = null;
                     display: flex; gap: 8px; flex-wrap: wrap;
                 }
                 #${POPUP_ID} .button-group .button { flex: 1 1 auto; min-width: 92px; }
+                #${POPUP_ID} .api-options-row {
+                    display: flex; align-items: center; justify-content: space-between;
+                    gap: 12px; flex-wrap: wrap;
+                }
+                #${POPUP_ID} .api-options-row .checkbox-group { margin: 0; }
+                #${POPUP_ID} .api-clear-config {
+                    flex: none; min-width: 0; padding: 7px 8px; font-size: 11px;
+                }
+                #${POPUP_ID} .api-main-actions {
+                    display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px;
+                }
 
                 /* ===== 统计区 ===== */
                 #${POPUP_ID} .stats-area {
@@ -2861,15 +2872,17 @@ let activePopupHandle = null;
                                     <label for="${SCRIPT_ID_PREFIX}-api-model">选择模型</label>
                                     <div class="input-group">
                                         <select id="${SCRIPT_ID_PREFIX}-api-model"><option value="">请先加载模型</option></select>
-                                        <button id="${SCRIPT_ID_PREFIX}-load-models" class="button button-subtle flex-shrink-0">加载模型</button>
                                     </div>
                                 </div>
-                                <div class="checkbox-group">
-                                    <input type="checkbox" id="${SCRIPT_ID_PREFIX}-stream-summary-checkbox">
-                                    <label for="${SCRIPT_ID_PREFIX}-stream-summary-checkbox">启用流式总结</label>
+                                <div class="api-options-row">
+                                    <div class="checkbox-group">
+                                        <input type="checkbox" id="${SCRIPT_ID_PREFIX}-stream-summary-checkbox">
+                                        <label for="${SCRIPT_ID_PREFIX}-stream-summary-checkbox">启用流式总结</label>
+                                    </div>
+                                    <button type="button" id="${SCRIPT_ID_PREFIX}-clear-config" class="button button-subtle api-clear-config" title="清除当前 API 配置">清除配置</button>
                                 </div>
-                                <div class="button-group">
-                                    <button id="${SCRIPT_ID_PREFIX}-clear-config" class="button button-secondary">清除配置</button>
+                                <div class="api-main-actions">
+                                    <button type="button" id="${SCRIPT_ID_PREFIX}-load-models" class="button button-secondary">加载模型</button>
                                     <button id="${SCRIPT_ID_PREFIX}-save-config" class="button button-primary">保存配置</button>
                                 </div>
                             </div>
